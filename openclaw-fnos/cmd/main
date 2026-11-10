@@ -1,0 +1,64 @@
+#!/bin/bash
+set -euo pipefail
+umask 077
+: "${TRIM_APPDEST:?}" "${TRIM_PKGVAR:?}" "${TRIM_PKGETC:?}" "${TRIM_PKGHOME:?}"
+mkdir -p "$TRIM_PKGVAR/run"
+pidfile="$TRIM_PKGVAR/run/shell.pid"
+socket="$TRIM_APPDEST/app.sock"
+runtime="$TRIM_PKGVAR/runtime/node-v24.22.2-linux-x64"
+node="$runtime/bin/node"
+server="$TRIM_APPDEST/shell/server.mjs"
+exec 9>"$TRIM_PKGVAR/run/lifecycle.lock"
+flock -x 9
+
+birth() {
+ local statline
+ statline=$(cat "/proc/$1/stat" 2>/dev/null) || return 1
+ awk '{if ($1 != "Z") print $20}' <<< "${statline##*) }"
+}
+alive() {
+ [[ -r "$pidfile" ]] && read -r pid started < "$pidfile" || return 1
+ [[ $pid =~ ^[0-9]+$ && $pid -gt 1 && $started =~ ^[0-9]+$ ]] || return 1
+ [[ $(birth "$pid") == "$started" ]] || return 1
+ [[ $(stat -c %u "/proc/$pid") == "$(id -u)" ]] || return 1
+ tr '\0' '\n' < "/proc/$pid/cmdline" | grep -Fxq -e "$server" -e "$(readlink -f "$server")"
+}
+stop() {
+ if alive; then
+  kill -TERM "$pid" 2>/dev/null || true
+  for ((i=0;i<200;i++)); do
+   alive || break
+   sleep .1
+  done
+  if alive; then printf '%s\n' 'OpenClaw 应用壳正在退出，请稍后重试。' >&2; return 1; fi
+ fi
+ rm -f -- "$pidfile"
+}
+case "${1:-}" in
+ start)
+  if alive && [[ -S "$socket" ]]; then exit 0; fi
+  stop
+  if [[ -S "$socket" ]]; then rm -- "$socket"; fi
+  if [[ ! -x "$node" || ! -r "$runtime/lib/node_modules/npm/bin/npm-cli.js" ]]; then
+   mkdir -p "$TRIM_PKGVAR/runtime"
+   tar -xzf "$TRIM_APPDEST/node-runtime.tar.gz" -C "$TRIM_PKGVAR/runtime"
+  fi
+  export FN_OPENCLAW_NPM="$runtime/lib/node_modules/npm/bin/npm-cli.js"
+  setsid "$node" "$server" 9>&- </dev/null >>"$TRIM_PKGVAR/run/shell.log" 2>&1 &
+  pid=$!
+  started=$(birth "$pid")
+  [[ -n "$started" ]]
+  printf '%s %s\n' "$pid" "$started" >"$pidfile"
+  for ((i=0;i<100;i++)); do
+   [[ $(birth "$pid") == "$started" ]] || break
+   if [[ -S "$socket" ]] && alive; then exit 0; fi
+   sleep .1
+  done
+  stop
+  printf '%s\n' 'OpenClaw 应用壳启动失败，请查看 shell.log。' >&2
+  exit 1
+  ;;
+ stop) stop ;;
+ status) alive && [[ -S "$socket" ]] || exit 3 ;;
+ *) exit 1 ;;
+esac

@@ -1,0 +1,13 @@
+#!/bin/bash
+set -euo pipefail
+socket="${TRIM_PKGVAR:-/var/apps/openclaw-fnos/var}/run/core-control.sock"
+case "${1:-}" in
+ status) exec curl --fail-with-body --silent --show-error --unix-socket "$socket" http://localhost/status ;;
+ start|stop|restart) exec curl --fail-with-body --silent --show-error --unix-socket "$socket" -X POST "http://localhost/$1" ;;
+ update)
+  version=${2:-}
+  [[ $version =~ ^[0-9]{4}\.[0-9]{1,2}\.[0-9]{1,3}(-[0-9]{1,3})?$ ]] || exit 2
+  exec curl --fail-with-body --silent --show-error --unix-socket "$socket" -X POST "http://localhost/update/$version"
+  ;;
+ *) printf '%s\n' '用法：fn-openclaw-core status | start | stop | restart | update VERSION'; exit 2 ;;
+esac

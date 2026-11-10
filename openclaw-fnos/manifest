@@ -1,0 +1,13 @@
+appname=openclaw-fnos
+version=2026.11.2-9
+display_name=OpenClaw
+desc=在飞牛桌面运行 OpenClaw，提供启动、停止、重启、日志与独立网页入口。
+platform=x86
+source=thirdparty
+maintainer=HANSHOJIN
+maintainer_url=https://github.com/HANSHOJIN
+desktop_uidir=ui
+desktop_applaunchname=openclaw-fnos.Application
+ctl_stop=true
+checkport=false
+disable_authorization_path=false

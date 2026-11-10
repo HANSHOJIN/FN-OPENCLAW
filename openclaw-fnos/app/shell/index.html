@@ -1,0 +1,29 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>OpenClaw</title>
+  <link rel="icon" href="./favicon.png">
+  <link rel="stylesheet" href="./shell.css">
+</head>
+<body>
+  <div id="toolbar-slot">
+    <div id="toolbar">
+      <span id="status" role="status">__FN_OPENCLAW_STATUS__</span>
+      <nav aria-label="OpenClaw 操作">
+        <button id="power" disabled>启动</button>
+        <button id="restart" disabled>重启</button>
+        <button id="logs" aria-pressed="true" disabled>日志</button>
+        <a id="standalone" target="_blank" rel="noopener" aria-disabled="true">独立打开 ↗</a>
+      </nav>
+    </div>
+  </div>
+  <main>
+    <p id="gateway-notice" hidden></p>
+    <pre id="log" tabindex="0" aria-label="运行日志">__FN_OPENCLAW_LOG__</pre>
+    <iframe id="control" title="OpenClaw Control UI" hidden></iframe>
+  </main>
+  <script>__FN_OPENCLAW_SCRIPT__</script>
+</body>
+</html>

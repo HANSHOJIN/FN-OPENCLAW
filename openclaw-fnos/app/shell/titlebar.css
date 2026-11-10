@@ -1,0 +1,57 @@
+.trim-ui__app-layout--header:has([data-fn-openclaw-titlebar][data-fn-openclaw-scheme="dark"]) {
+  color-scheme: dark;
+  background: #0e1015 !important;
+  color: #e5e7eb !important;
+}
+.trim-ui__app-layout--header:has([data-fn-openclaw-titlebar][data-fn-openclaw-scheme="light"]) {
+  color-scheme: light;
+  background: #faf9f7 !important;
+  color: #25262b !important;
+}
+.trim-ui__app-layout--header:has([data-fn-openclaw-titlebar]) :is(.trim-ui__app-layout--header-title, [class*="app-layout-header-"]) {
+  color: inherit !important;
+}
+[data-fn-openclaw-titlebar] {
+  position: relative;
+  display: flex;
+  flex: 0 1 auto;
+  min-width: 0;
+  align-items: center;
+  align-self: center;
+  margin-inline: auto 6px;
+  color: inherit;
+  font: 12px/1.2 system-ui, sans-serif;
+}
+[data-fn-openclaw-titlebar] [role="status"] {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  overflow: hidden;
+  clip-path: inset(50%);
+  white-space: nowrap;
+}
+[data-fn-openclaw-titlebar] nav {
+  display: flex;
+  min-width: 0;
+  gap: 2px;
+}
+[data-fn-openclaw-titlebar] :is(button, a) {
+  box-sizing: border-box;
+  display: block;
+  min-width: 0;
+  padding: 4px 6px;
+  overflow: hidden;
+  border: 0;
+  border-radius: 4px;
+  color: inherit;
+  background: transparent;
+  font: inherit;
+  text-decoration: none;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+[data-fn-openclaw-titlebar] :is(button:disabled, a[aria-disabled="true"]) { opacity: .5; }
+[data-fn-openclaw-titlebar] :is(button:not(:disabled), a[href]) { cursor: pointer; }
+[data-fn-openclaw-titlebar] :is(button:not(:disabled):hover, a[href]:hover, button[aria-pressed="true"]:not(:disabled)) {
+  background: color-mix(in srgb, currentColor 12%, transparent);
+}
