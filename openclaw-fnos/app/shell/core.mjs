@@ -268,12 +268,32 @@ export class Core {
     this.log('OpenClaw 已就绪。')
   }
 
-  async gatewayReady() {
+  async gatewayReady({ verifyCore = false } = {}) {
     const base = 'http://127.0.0.1:' + this.port
+    const probe = route => fetch(base + route, {
+      headers: { accept: 'application/json' }, signal: AbortSignal.timeout(1500), redirect: 'manual',
+    })
     try {
-      const ready = await fetch(base + '/readyz', { signal: AbortSignal.timeout(1500), redirect: 'manual' })
-      await ready.body?.cancel()
-      if (!ready.ok) return false
+      const startup = await probe('/startupz')
+      // Older cores can return a 404 or their HTML fallback for this route.
+      const legacy = startup.status === 404 ||
+        (startup.ok && startup.headers.get('content-type')?.startsWith('text/html'))
+      if (legacy || !startup.ok) {
+        await startup.body?.cancel()
+        if (!legacy) return false
+      } else if ((await startup.json())?.status !== 'started') {
+        return false
+      }
+      if (legacy || verifyCore) {
+        const ready = await probe('/readyz')
+        if (!ready.ok && (legacy || ready.status !== 503)) {
+          await ready.body?.cancel()
+          return false
+        }
+        const health = await ready.json()
+        // A candidate with a working core can be activated even if a channel is offline.
+        if (ready.ok ? health?.ready !== true : health?.ready !== false || health?.coreReady !== true) return false
+      }
       const ui = await fetch(base + UI_PATH + '/', { signal: AbortSignal.timeout(3000), redirect: 'manual' })
       return ui.ok && (await ui.text()).includes('<openclaw-app')
     } catch { return false }
@@ -322,7 +342,7 @@ export class Core {
     }
   }
 
-  async startCore(version = this.version, entry) {
+  async startCore(version = this.version, entry, { verifyCore = false } = {}) {
     entry ??= await this.install(version)
     if (this.closing) return
     this.phase = 'starting'
@@ -350,7 +370,7 @@ export class Core {
     this.watchGateway(child)
     const deadline = Date.now() + 120000
     while (Date.now() < deadline && this.phase === 'starting' && !this.closing) {
-      if (await this.gatewayReady() && this.phase === 'starting' && !this.closing &&
+      if (await this.gatewayReady({ verifyCore }) && this.phase === 'starting' && !this.closing &&
           (process.platform !== 'linux' || this.ownedGateways(version).some(owner => ownsGatewayListener(owner, this.port)))) {
         this.markRunning()
         return
@@ -414,7 +434,7 @@ export class Core {
     try {
       fs.renameSync(this.stateDir, backup)
       await fs.promises.cp(backup, this.stateDir, { recursive: true, verbatimSymlinks: true })
-      await this.startCore(target, entry)
+      await this.startCore(target, entry, { verifyCore: true })
       if (this.phase !== 'running') throw new Error('候选版本未完成启动。')
       saveJSON(this.activeFile, { version: target, previous, snapshot })
     } catch (error) {

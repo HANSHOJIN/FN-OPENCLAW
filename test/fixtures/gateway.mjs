@@ -27,8 +27,15 @@ const server = http.createServer((req, res) => {
     })
   } else if (req.url === '/pid') {
     res.end(String(process.pid))
+  } else if (req.url === '/startupz') {
+    res.writeHead(200, { 'content-type': 'application/json' })
+    res.end(JSON.stringify({ ok: true, status: 'started' }))
+  } else if (req.url === '/readyz') {
+    const ready = mode !== 'channel-offline'
+    res.writeHead(ready ? 200 : 503, { 'content-type': 'application/json' })
+    res.end(JSON.stringify({ ready, coreReady: true, failing: ready ? [] : ['whatsapp'] }))
   } else {
-    res.end(req.url === '/readyz' ? 'ready' : '<openclaw-app></openclaw-app>')
+    res.end('<openclaw-app></openclaw-app>')
   }
 })
 server.listen(Number(port), '127.0.0.1')

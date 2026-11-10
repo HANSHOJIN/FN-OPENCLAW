@@ -6,7 +6,7 @@ import path from 'node:path'
 import { setTimeout as delay } from 'node:timers/promises'
 import { test } from 'node:test'
 import { Core } from '../openclaw-fnos/app/shell/core.mjs'
-import { CORE_VERSION } from '../openclaw-fnos/app/shell/defaults.mjs'
+import { CORE_VERSION, UI_PATH } from '../openclaw-fnos/app/shell/defaults.mjs'
 
 async function listen(server, port = 0) {
   await new Promise((resolve, reject) => {
@@ -68,7 +68,7 @@ test('adopts an owned successor and can stop it after the wrapper restarts', {
   skip: process.platform !== 'linux',
 }, async t => {
   const f = await fixture(t)
-  f.install(CORE_VERSION, 'serve,successor')
+  f.install(CORE_VERSION, 'channel-offline,successor')
   await action(f.core, 'boot')
   assert.equal(f.core.phase, 'running', f.core.tail())
   const original = f.core.gateway.pid
@@ -114,6 +114,64 @@ test('a foreign ready listener is neither trusted nor stopped', async t => {
   assert.equal(f.core.status().paused, true)
   assert.equal(stranger.listening, true)
   assert.equal(f.core.status().retryAt, null)
+})
+
+test('startup tolerates channel failures while upgrades still check core readiness', async t => {
+  const f = await fixture(t)
+  let startup = [200, { ok: true, status: 'started' }]
+  let readiness = [503, { ready: false, coreReady: true, failing: ['whatsapp'] }]
+  let ui = '<openclaw-app></openclaw-app>'
+  let readyRequests = 0
+  const gateway = http.createServer((req, res) => {
+    if (req.url === UI_PATH + '/') {
+      res.end(ui)
+      return
+    }
+    if (req.url === '/readyz') readyRequests += 1
+    const [status, body, type = 'application/json'] = req.url === '/startupz' ? startup : readiness
+    res.writeHead(status, { 'content-type': type })
+    res.end(type === 'application/json' ? JSON.stringify(body) : body)
+  })
+  await listen(gateway, f.port)
+  t.after(() => close(gateway))
+  assert.equal(await f.core.gatewayReady(), true)
+  assert.equal(readyRequests, 0)
+  assert.equal(await f.core.gatewayReady({ verifyCore: true }), true)
+
+  readiness = [503, { ready: false, coreReady: false }]
+  assert.equal(await f.core.gatewayReady(), true)
+  assert.equal(await f.core.gatewayReady({ verifyCore: true }), false)
+  readiness = [200, { ready: true }]
+  for (const status of ['starting', 'draining']) {
+    startup = [503, { ok: false, status }]
+    assert.equal(await f.core.gatewayReady(), false)
+  }
+  startup = [200, { ok: true }]
+  assert.equal(await f.core.gatewayReady(), false)
+  for (const missing of [[404, {}], [200, '<html>fallback</html>', 'text/html']]) {
+    startup = missing
+    assert.equal(await f.core.gatewayReady(), true)
+    assert.equal(await f.core.gatewayReady({ verifyCore: true }), true)
+  }
+  readiness = [200, '<html>fallback</html>', 'text/html']
+  assert.equal(await f.core.gatewayReady(), false)
+  startup = [200, { ok: true, status: 'started' }]
+  ui = '<html>not the Control UI</html>'
+  assert.equal(await f.core.gatewayReady(), false)
+})
+
+test('a candidate with an unhealthy channel can replace the active runtime', async t => {
+  const f = await fixture(t)
+  const candidate = '2099.1.1'
+  f.install(CORE_VERSION)
+  f.install(candidate, 'channel-offline')
+  await action(f.core, 'boot')
+  const sample = path.join(f.core.stateDir, 'sample.txt')
+  fs.writeFileSync(sample, 'original data')
+  await action(f.core, 'update', candidate)
+  assert.equal(f.core.phase, 'running', f.core.tail())
+  assert.equal(f.core.version, candidate)
+  assert.equal(fs.readFileSync(sample, 'utf8'), 'original data')
 })
 
 test('an unexpected exit recovers and a manual stop cancels a pending recovery', async t => {
