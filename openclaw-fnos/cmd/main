@@ -5,8 +5,10 @@ umask 077
 mkdir -p "$TRIM_PKGVAR/run"
 pidfile="$TRIM_PKGVAR/run/shell.pid"
 socket="$TRIM_APPDEST/app.sock"
-runtime="$TRIM_PKGVAR/runtime/node-v24.22.2-linux-x64"
+runtime_root="$TRIM_PKGVAR/runtime"
+runtime="$runtime_root/node-v24.22.2-linux-x64"
 node="$runtime/bin/node"
+npm_cli=lib/node_modules/npm/bin/npm-cli.js
 server="$TRIM_APPDEST/shell/server.mjs"
 exec 9>"$TRIM_PKGVAR/run/lifecycle.lock"
 flock -x 9
@@ -34,16 +36,31 @@ stop() {
  fi
  rm -f -- "$pidfile"
 }
+
+prepare_runtime() (
+ local stage="$runtime_root/.node-extract"
+ local candidate="$stage/${runtime##*/}"
+ rm -rf -- "$stage"
+ if [[ -f "$runtime/.fn-openclaw-ready" && -x "$node" && -r "$runtime/$npm_cli" ]]; then exit 0; fi
+ mkdir -p -- "$stage"
+ trap 'rm -rf -- "$stage"' EXIT
+ tar -xzf "$TRIM_APPDEST/node-runtime.tar.gz" -C "$stage" || exit 1
+ if [[ ! -x "$candidate/bin/node" || ! -r "$candidate/$npm_cli" ]]; then
+  printf '%s\n' 'Node.js 运行时文件不完整。' >&2
+  exit 1
+ fi
+ : > "$candidate/.fn-openclaw-ready"
+ if [[ -e "$runtime" || -L "$runtime" ]]; then mv -T -- "$runtime" "$stage/previous"; fi
+ mv -T -- "$candidate" "$runtime"
+)
+
 case "${1:-}" in
  start)
   if alive && [[ -S "$socket" ]]; then exit 0; fi
   stop
   if [[ -S "$socket" ]]; then rm -- "$socket"; fi
-  if [[ ! -x "$node" || ! -r "$runtime/lib/node_modules/npm/bin/npm-cli.js" ]]; then
-   mkdir -p "$TRIM_PKGVAR/runtime"
-   tar -xzf "$TRIM_APPDEST/node-runtime.tar.gz" -C "$TRIM_PKGVAR/runtime"
-  fi
-  export FN_OPENCLAW_NPM="$runtime/lib/node_modules/npm/bin/npm-cli.js"
+  prepare_runtime
+  export FN_OPENCLAW_NPM="$runtime/$npm_cli"
   setsid "$node" "$server" 9>&- </dev/null >>"$TRIM_PKGVAR/run/shell.log" 2>&1 &
   pid=$!
   started=$(birth "$pid")
