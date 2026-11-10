@@ -60,7 +60,7 @@
 
 ## Gateway 恢复与维护
 
-Gateway 把整进程重启交给应用壳时，或进程意外退出时，应用壳会启动接替进程。每次自动尝试前分别等待 2、5、15、30 秒。连续重试 4 次仍无法稳定运行时，界面和日志会显示故障，修复后可手动启动。网关就绪并运行满 1 分钟后，下一次故障从第一次重试开始计算。
+Gateway 把整进程重启交给应用壳时，或进程意外退出时，应用壳会尝试恢复。若本实例的接替进程已启动，应用壳会核对进程归属、监听端口和就绪状态后接管。无法确认归属的端口占用会报错。每次自动尝试前分别等待 2、5、15、30 秒。连续重试 4 次仍无法稳定运行时，界面和日志会显示故障，修复后可手动启动。网关就绪并运行满 1 分钟后，下一次故障从第一次重试开始计算。
 
 点击「停止」会暂停自动恢复，即使飞牛重新启动应用壳也会保持暂停。离线维护可从 NAS 的独立终端执行以下命令。确认 `stop` 成功返回 `phase: stopped` 后再操作数据，完成后执行 `start`，用 `status` 确认 `phase: running`。日常手动重启可用 `restart`。
 
@@ -90,3 +90,7 @@ python scripts/build.py --fnpack /path/to/fnpack
 ```
 
 安装包和 SHA256 校验文件输出到 `dist/`。使用上游 OpenClaw 核心、Control UI 和官方 Linux 桌面图标，授权声明随包附带。[上游图标素材](https://github.com/openclaw/openclaw/tree/v2026.11.2/apps/linux/src-tauri/icons) · [第三方授权声明](openclaw-fnos/app/THIRD-PARTY-NOTICES.txt)
+
+## 自动化测试
+
+使用 Node.js 24 运行 `node --test test/core.test.mjs`。测试使用临时数据目录和模拟 Gateway，覆盖进程退出、重试退避、未知端口占用、维护停机以及升级回滚。接替进程归属检测在 Linux 上执行。

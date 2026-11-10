@@ -5,6 +5,7 @@ import path from 'node:path'
 import net from 'node:net'
 import { setTimeout as delay } from 'node:timers/promises'
 import { CORE_PORT, CORE_VERSION, UI_PATH } from './defaults.mjs'
+import { INSTANCE_ENV, findGatewayProcesses, isSameProcess, ownsGatewayListener } from './gateway-process.mjs'
 
 const RETRY_DELAYS = [2000, 5000, 15000, 30000]
 const STABLE_UPTIME = 60000
@@ -42,6 +43,19 @@ function groupHasLiveProcess(pid) {
   })
 }
 
+async function stopProcess(exited, send) {
+  const waitForExit = async timeout => {
+    const deadline = performance.now() + timeout
+    while (!exited() && performance.now() < deadline) await delay(100)
+    return exited()
+  }
+  if (exited()) return
+  send('SIGTERM')
+  if (await waitForExit(12000)) return
+  send('SIGKILL')
+  if (!await waitForExit(2000)) throw new Error('无法确认 OpenClaw 进程已退出。')
+}
+
 export class Core {
   constructor({ data, config, home, npm, ca, port = CORE_PORT }) {
     this.data = data
@@ -51,6 +65,7 @@ export class Core {
     this.logFile = path.join(data, 'gateway.log')
     this.activeFile = path.join(data, 'active.json')
     this.transactionFile = path.join(data, 'update.json')
+    this.ownerFile = path.join(data, 'gateway-owner.json')
     this.pauseFile = path.join(data, 'gateway-stopped')
     this.paused = fs.existsSync(this.pauseFile)
     this.npm = npm
@@ -80,7 +95,6 @@ export class Core {
     }
     this.version = readJSON(this.activeFile)?.version ?? CORE_VERSION
     if (!validVersion(this.version)) throw new Error('运行版本记录无效。')
-    this.recoverUpdate()
   }
 
   recoverUpdate() {
@@ -203,7 +217,7 @@ export class Core {
   async install(version) {
     const dir = path.join(this.runtimes, version)
     const module = path.join(dir, 'node_modules', 'openclaw')
-    const entry = path.join(module, 'openclaw.mjs')
+    const entry = this.gatewayEntry(version)
     if (fs.existsSync(path.join(dir, 'installed')) && readJSON(path.join(module, 'package.json'))?.version === version && fs.existsSync(entry)) return entry
     if (!this.gateway) this.phase = 'installing'
     this.log('正在下载 OpenClaw ' + version + '，首次安装可能需要几分钟。')
@@ -220,6 +234,76 @@ export class Core {
     }
     fs.writeFileSync(path.join(dir, 'installed'), version)
     return entry
+  }
+
+  gatewayEntry(version) {
+    return path.join(this.runtimes, version, 'node_modules', 'openclaw', 'openclaw.mjs')
+  }
+
+  ownedGateways(version) {
+    if (process.platform !== 'linux') return []
+    const owner = readJSON(this.ownerFile)
+    if (!owner) return []
+    if (!validVersion(owner.version) || !/^[a-f0-9]{32}$/.test(owner.instance)) throw new Error('Gateway 归属记录无效。')
+    if (version && owner.version !== version) return []
+    return findGatewayProcesses(this.gatewayEntry(owner.version), this.env, owner.instance)
+  }
+
+  watchGateway(gateway) {
+    this.gateway = gateway
+    gateway.exited.then(({ code, signal, error }) => {
+      if (this.gateway !== gateway || this.phase === 'stopping' || this.closing) return
+      if (this.phase === 'running' && performance.now() - this.readySince >= STABLE_UPTIME) this.retryCount = 0
+      const reason = signal ?? code
+      this.recordFailure(error?.message ?? 'OpenClaw Gateway 已退出' + (reason == null ? '。' : '（' + reason + '）。'))
+      this.scheduleRecovery()
+    })
+  }
+
+  markRunning() {
+    this.phase = 'running'
+    this.failure = ''
+    this.readySince = performance.now()
+    this.generation += 1
+    this.log('OpenClaw 已就绪。')
+  }
+
+  async gatewayReady() {
+    const base = 'http://127.0.0.1:' + this.port
+    try {
+      const ready = await fetch(base + '/readyz', { signal: AbortSignal.timeout(1500), redirect: 'manual' })
+      await ready.body?.cancel()
+      if (!ready.ok) return false
+      const ui = await fetch(base + UI_PATH + '/', { signal: AbortSignal.timeout(3000), redirect: 'manual' })
+      return ui.ok && (await ui.text()).includes('<openclaw-app')
+    } catch { return false }
+  }
+
+  async adoptGateway() {
+    const deadline = Date.now() + 120000
+    while (!this.closing) {
+      const owners = this.ownedGateways(this.version)
+      if (!owners.length) return false
+      this.phase = 'starting'
+      const owner = owners.find(candidate => ownsGatewayListener(candidate, this.port))
+      if (owner && await this.gatewayReady() && !this.closing && ownsGatewayListener(owner, this.port)) {
+        const exited = new Promise(resolve => {
+          const timer = setInterval(() => {
+            if (isSameProcess(owner)) return
+            clearInterval(timer)
+            resolve({})
+          }, 500)
+          timer.unref()
+        })
+        this.watchGateway({ ...owner, adopted: true, exited })
+        this.log('已接管本实例的 Gateway（PID ' + owner.pid + '）。')
+        this.markRunning()
+        return true
+      }
+      if (Date.now() >= deadline) throw new Error('已找到本实例的 Gateway，但未能确认它已就绪。')
+      await delay(500)
+    }
+    return false
   }
 
   async assertPortFree() {
@@ -255,38 +339,22 @@ export class Core {
     // Fail if someone else already owns this port, rather than proxying to them.
     await this.assertPortFree()
     if (this.closing) return
+    const instance = randomBytes(16).toString('hex')
+    saveJSON(this.ownerFile, { version, instance })
     this.log('启动 OpenClaw ' + version + '。')
     const child = this.run([entry, 'gateway', 'run', '--port', String(this.port), '--bind', 'loopback', '--auth', 'token'], {
       ...this.env,
       OPENCLAW_SUPERVISOR_MODE: 'external',
+      [INSTANCE_ENV]: instance,
     })
-    child.exited.then(({ code, signal, error }) => {
-      if (this.gateway !== child) return
-      if (this.phase === 'stopping' || this.closing) return
-      if (this.phase === 'running' && performance.now() - this.readySince >= STABLE_UPTIME) this.retryCount = 0
-      this.recordFailure(error?.message ?? 'OpenClaw Gateway 已退出（' + (signal ?? code) + '）。')
-      this.scheduleRecovery()
-    })
-    this.gateway = child
-    const base = 'http://127.0.0.1:' + this.port
+    this.watchGateway(child)
     const deadline = Date.now() + 120000
     while (Date.now() < deadline && this.phase === 'starting' && !this.closing) {
-      try {
-        const ready = await fetch(base + '/readyz', { signal: AbortSignal.timeout(1500) })
-        await ready.body?.cancel()
-        if (ready.ok) {
-          const ui = await fetch(base + UI_PATH + '/', { signal: AbortSignal.timeout(3000), redirect: 'manual' })
-          const html = await ui.text()
-          if (ui.ok && html.includes('<openclaw-app') && this.phase === 'starting' && !this.closing) {
-            this.phase = 'running'
-            this.failure = ''
-            this.readySince = performance.now()
-            this.generation += 1
-            this.log('OpenClaw 已就绪。')
-            return
-          }
-        }
-      } catch { /* retry until both the gateway and Control UI are ready */ }
+      if (await this.gatewayReady() && this.phase === 'starting' && !this.closing &&
+          (process.platform !== 'linux' || this.ownedGateways(version).some(owner => ownsGatewayListener(owner, this.port)))) {
+        this.markRunning()
+        return
+      }
       await delay(500)
     }
     if (!this.closing) throw new Error(this.phase === 'failed' ? this.failure : 'OpenClaw 或 Control UI 启动超时。请核对网关配置。')
@@ -295,30 +363,31 @@ export class Core {
   async stopChild(child) {
     if (!child?.pid) return
     const exited = () => (child.exitCode !== null || child.signalCode !== null) && !groupHasLiveProcess(child.pid)
-    const waitForExit = async timeout => {
-      const deadline = performance.now() + timeout
-      while (!exited() && performance.now() < deadline) await delay(100)
-      return exited()
-    }
     const send = signal => {
       try {
         if (process.platform === 'win32') child.kill(signal)
         else process.kill(-child.pid, signal)
       } catch (error) { if (error.code !== 'ESRCH') throw error }
     }
-    if (exited()) return
-    send('SIGTERM')
-    if (await waitForExit(12000)) return
-    send('SIGKILL')
-    if (!await waitForExit(2000)) throw new Error('无法确认 OpenClaw 进程已退出。')
+    await stopProcess(exited, send)
   }
 
   async stopCore() {
     this.phase = 'stopping'
-    if (this.gateway) {
-      await this.stopChild(this.gateway)
-      this.log('OpenClaw Gateway 进程已退出。')
+    if (this.gateway && !this.gateway.adopted) await this.stopChild(this.gateway)
+    const owners = this.ownedGateways()
+    for (const owner of owners) {
+      // A detached successor may outlive the child the shell originally started.
+      const group = owner.group > 1 && owner.group === owner.session && owner.group !== process.pid ? owner.group : 0
+      const exited = () => !isSameProcess(owner) && (!group || !groupHasLiveProcess(group))
+      await stopProcess(exited, signal => {
+        if (!isSameProcess(owner)) return
+        try { process.kill(group ? -group : owner.pid, signal) }
+        catch (error) { if (error.code !== 'ESRCH') throw error }
+      })
     }
+    if (this.ownedGateways().length) throw new Error('仍有本实例的 Gateway 进程正在运行。')
+    if (this.gateway || owners.length) this.log('OpenClaw Gateway 进程已退出。')
     this.gateway = undefined
     this.phase = 'stopped'
   }
@@ -348,16 +417,19 @@ export class Core {
       await this.startCore(target, entry)
       if (this.phase !== 'running') throw new Error('候选版本未完成启动。')
       saveJSON(this.activeFile, { version: target, previous, snapshot })
-      this.version = target
-      fs.unlinkSync(this.transactionFile)
-      this.log('已切换到 OpenClaw ' + target + '。')
     } catch (error) {
       this.log(error.message)
       await this.stopCore()
       await this.assertPortFree()
       this.recoverUpdate()
       if (!this.closing) await this.startCore(previous)
+      return
     }
+    this.version = target
+    this.log('已切换到 OpenClaw ' + target + '。')
+    // The version switch is committed. Cleanup errors must never start the old runtime on the new state.
+    try { fs.unlinkSync(this.transactionFile) }
+    catch (error) { this.log('升级已提交，暂未清理恢复记录。' + error.message) }
   }
 
   action(action, version) {
@@ -369,15 +441,18 @@ export class Core {
     if (['start', 'stop', 'restart'].includes(action)) this.retryCount = 0
     this.job = Promise.resolve().then(async () => {
       if (action === 'update') return this.update(version)
-      if (action === 'stop' || this.gateway) await this.stopCore()
+      const interrupted = fs.existsSync(this.transactionFile)
+      if (!interrupted && !['stop', 'restart'].includes(action) && await this.adoptGateway()) return
+      if (action === 'stop' || action === 'restart' || interrupted || this.gateway) await this.stopCore()
       if (action === 'stop') {
         this.phase = 'stopping'
         await this.assertPortFree()
+        this.recoverUpdate()
         this.phase = 'stopped'
         this.failure = ''
         this.log('Gateway 已停止，端口已释放。自动恢复已暂停。')
       } else if (!this.closing) {
-        if (fs.existsSync(this.transactionFile)) {
+        if (interrupted) {
           await this.assertPortFree()
           this.recoverUpdate()
         }
