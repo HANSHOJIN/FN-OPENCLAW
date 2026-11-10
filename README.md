@@ -14,7 +14,7 @@
 
 <img src="assets/openclaw-fnos-mobile.png" width="300" alt="OpenClaw 在飞牛手机 App 中的会话界面，会话名称和标识已脱敏">
 
-手机端演示图来自实机验证通过的 `2026.11.2-12` 测试版。
+手机端演示图基于飞牛手机 App 实机截图，已脱敏。
 
 ## 功能
 
@@ -25,9 +25,9 @@
 
 ## 安装与使用
 
-当前发布版为 **2026.11.2-10**，适用于 **x86_64** 飞牛设备，初始 OpenClaw 核心为 **2026.11.2**。
+当前发布版为 **2026.11.2-13**，适用于 **x86_64** 飞牛设备，初始 OpenClaw 核心为 **2026.11.2**。
 
-1. 从 [v2026.11.2-10 发布页](https://github.com/HANSHOJIN/FN-OPENCLAW/releases/tag/v2026.11.2-10) 下载 `OpenClaw-fnOS-2026.11.2-10-x86_64.fpk`。
+1. 从 [v2026.11.2-13 发布页](https://github.com/HANSHOJIN/FN-OPENCLAW/releases/tag/v2026.11.2-13) 下载 `OpenClaw-fnOS-2026.11.2-13-x86_64.fpk`。
 2. 在飞牛应用中心选择 **手动安装**，上传 FPK。升级同一应用时直接覆盖安装。
 3. 从飞牛桌面打开 **OpenClaw**。首次启动需要连接 npm Registry 下载核心和依赖，进度可在日志里查看。
 4. 界面打开后，在 OpenClaw 内连接自己的模型，再开始对话。
