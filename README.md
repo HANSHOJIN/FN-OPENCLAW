@@ -12,6 +12,10 @@
 
 ![OpenClaw 在飞牛桌面中的运行界面，顶部可见停止、重启、日志和独立打开按钮](assets/openclaw-fnos-desktop.png)
 
+<img src="assets/openclaw-fnos-mobile.png" width="300" alt="OpenClaw 在飞牛手机 App 中的会话界面，会话名称和标识已脱敏">
+
+手机端演示图来自实机验证通过的 `2026.11.2-12` 测试版。
+
 ## 功能
 
 - 启动／停止、重启、日志和独立打开都在**飞牛窗口标题栏**。飞牛窗口结构不支持时，按钮会显示在应用内容区顶部。
@@ -93,4 +97,4 @@ python scripts/build.py --fnpack /path/to/fnpack
 
 ## 自动化测试
 
-使用 Node.js 24 运行 `node --test test/core.test.mjs`。测试使用临时数据目录和模拟 Gateway，覆盖进程退出、重试退避、未知端口占用、维护停机以及升级回滚。接替进程归属检测在 Linux 上执行。
+使用 Node.js 24 运行 `node --test test/core.test.mjs test/server.test.mjs`。测试使用临时数据目录和模拟 Gateway，覆盖进程恢复、维护停机、升级回滚和 FN Connect 中继访问。接替进程归属检测在 Linux 上执行。

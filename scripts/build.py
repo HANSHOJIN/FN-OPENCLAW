@@ -15,7 +15,7 @@ import urllib.request
 ROOT = Path(__file__).resolve().parents[1]
 NODE_ARCHIVE = 'node-v24.22.2-linux-x64.tar.gz'
 NODE_SHA256 = '361718c444e49af2ca5a110c83ba6a8901143f23ab285ebbef0341f391f482a9'
-FILENAME = 'OpenClaw-fnOS-2026.11.2-10-x86_64.fpk'
+FILENAME = 'OpenClaw-fnOS-2026.11.2-12-x86_64.fpk'
 
 
 def hash_file(path, algorithm='sha256'):

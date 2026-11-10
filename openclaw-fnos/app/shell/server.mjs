@@ -28,7 +28,23 @@ function isAdmin(req) {
   return /^\d+$/.test(req.headers['x-trim-userid'] ?? '') && req.headers['x-trim-isadmin'] === 'true'
 }
 
-function sameOrigin(req, desktopPort) {
+function isRelayOrigin(origin) {
+  return origin.protocol === 'https:' && /^[a-z0-9-]+\.app\.5ddd\.com$/.test(origin.hostname)
+}
+
+function isForwardedRelay(req, origin) {
+  if (!isRelayOrigin(origin) || req.headers['x-forwarded-proto'] !== 'https') return false
+  const host = new URL('http://' + req.headers.host).hostname
+  return ['localhost', '127.0.0.1', '[::1]'].includes(host)
+}
+
+function sameAppReferrer(req, origin) {
+  const referrer = new URL(req.headers.referer)
+  return referrer.origin === origin.origin &&
+    (referrer.pathname === PREFIX || referrer.pathname.startsWith(PREFIX + '/'))
+}
+
+function sameOrigin(req, desktopPort, { allowRelayReferrer = true } = {}) {
   const site = req.headers['sec-fetch-site']
   if (site && site !== 'same-origin' && site !== 'none') return false
   const origin = req.headers.origin
@@ -38,12 +54,16 @@ function sameOrigin(req, desktopPort) {
     if (!['http:', 'https:'].includes(parsed.protocol) || !req.headers.host) return false
     const forwardedHost = new URL(parsed.protocol + '//' + req.headers.host)
     if (parsed.host === forwardedHost.host) return true
-    if (forwardedHost.port || parsed.hostname !== forwardedHost.hostname) return false
-    // nginx forwards $host without a port. Plain HTTP browsers can omit
-    // Fetch Metadata. The mobile FN Connect relay can omit it as well.
-    const fnConnect = parsed.protocol === 'https:' && parsed.port === '41001' &&
-      /^[a-z0-9-]+\.app\.5ddd\.com$/.test(parsed.hostname)
-    return parsed.port === String(desktopPort) || fnConnect || site === 'same-origin'
+    // The native FN Connect bridge can replace Host with loopback. Require
+    // both the browser's same-origin metadata and this application's referrer.
+    if (parsed.hostname !== forwardedHost.hostname) {
+      return allowRelayReferrer && site === 'same-origin' && isForwardedRelay(req, parsed) && sameAppReferrer(req, parsed)
+    }
+    if (forwardedHost.port) return false
+    if (parsed.port === String(desktopPort) || site === 'same-origin') return true
+    // fnOS forwards $host without its port. FN Connect may choose another
+    // port for each connection, and the WebView may omit Fetch Metadata.
+    return allowRelayReferrer && isRelayOrigin(parsed) && sameAppReferrer(req, parsed)
   } catch { return false }
 }
 
@@ -66,11 +86,14 @@ function setOriginCookie(req, core, headers, desktopPort) {
 
 function websocketOrigin(req, core, desktopPort) {
   if (!req.headers.origin) return false
-  if (sameOrigin(req, desktopPort)) return true
+  if (sameOrigin(req, desktopPort, { allowRelayReferrer: false })) return true
   if (req.headers['sec-fetch-site'] && req.headers['sec-fetch-site'] !== 'same-origin') return false
   // Chromium omits Sec-Fetch-Site on WebSocket upgrades. In that case,
   // require a proof issued to this admin on a same-origin HTTP request.
-  if (!sameOrigin({ headers: { ...req.headers, 'sec-fetch-site': 'same-origin' } }, desktopPort)) return false
+  try {
+    if (!sameOrigin({ headers: { ...req.headers, 'sec-fetch-site': 'same-origin' } }, desktopPort) &&
+        !isForwardedRelay(req, new URL(req.headers.origin))) return false
+  } catch { return false }
   const proof = (req.headers.cookie || '').split(';').map(cookie => cookie.trim())
     .find(cookie => cookie.startsWith(originCookie + '='))?.slice(originCookie.length + 1)
   if (!proof || !/^[a-f\d]{64}$/.test(proof)) return false
