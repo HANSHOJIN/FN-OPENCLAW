@@ -7,7 +7,7 @@ import { setTimeout as delay } from 'node:timers/promises'
 import { test } from 'node:test'
 import { Core } from '../openclaw-fnos/app/shell/core.mjs'
 import { CORE_VERSION, UI_PATH } from '../openclaw-fnos/app/shell/defaults.mjs'
-import { prepareUpgrade } from '../openclaw-fnos/app/shell/maintenance.mjs'
+import { prepareUpgrade, auditUpgrade } from '../openclaw-fnos/app/shell/maintenance.mjs'
 
 async function listen(server, port = 0) {
   await new Promise((resolve, reject) => {
@@ -390,7 +390,7 @@ test('legacy interrupted upgrades never mistake the candidate owner record for a
   assert.equal(fs.readFileSync(path.join(next.stateDir, 'sample.txt'), 'utf8'), 'legacy original')
 })
 
-test('snapshot retention prunes only managed history and preserves legacy directories', async t => {
+test('snapshot retention keeps only the rollback point and pending transaction, preserving legacy directories', async t => {
   const f = await fixture(t)
   const legacy = 'snapshot-aaaaaaaaaaaaaaaa'
   fs.mkdirSync(path.join(f.core.data, legacy))
@@ -403,11 +403,16 @@ test('snapshot retention prunes only managed history and preserves legacy direct
   records.forEach((r, i) => { r.createdAt = i + 1 })
   fs.writeFileSync(f.core.snapshotsFile, JSON.stringify(records))
   fs.writeFileSync(f.core.activeFile, JSON.stringify({ version: CORE_VERSION, snapshot: records[0].name }))
+  fs.writeFileSync(f.core.transactionFile, JSON.stringify({ target: '2099.1.1', snapshot: records[3].name }))
   f.core.pruneSnapshots()
   assert.ok(fs.existsSync(path.join(f.core.data, legacy)))
   assert.ok(fs.existsSync(path.join(f.core.data, records[0].name)), 'active rollback point')
   assert.ok(!fs.existsSync(path.join(f.core.data, records[1].name)), 'unprotected old snapshot')
-  assert.equal(f.core.snapshots().length, 5)
+  assert.ok(fs.existsSync(path.join(f.core.data, records[3].name)), 'pending transaction snapshot')
+  assert.equal(f.core.snapshots().length, 3)
+  fs.unlinkSync(f.core.transactionFile)
+  f.core.pruneSnapshots()
+  assert.equal(f.core.snapshots().length, 2, 'one registered rollback point and the untouched legacy directory')
 })
 
 test('an expired maintenance lease resumes without attempting a stop', async t => {
@@ -442,4 +447,101 @@ test('a lost handoff response is retried with the same lease and process identit
   assert.equal(await prepareUpgrade(f.core), true)
   assert.equal(handoffs.length, 2)
   assert.deepEqual(handoffs[0], handoffs[1])
+})
+
+for (const fault of ['stop', 'port check', 'journal write', 'status write']) {
+  test('upgrade recovers service when the initial ' + fault + ' fails', async t => {
+    const f = await fixture(t)
+    f.install(CORE_VERSION)
+    f.install('2099.1.1')
+    await action(f.core, 'boot')
+    const sample = path.join(f.core.stateDir, 'sample.txt')
+    fs.writeFileSync(sample, 'original data')
+    let injected = false
+    if (fault === 'stop' || fault === 'port check') {
+      const method = fault === 'stop' ? 'stopCore' : 'assertPortFree'
+      const original = f.core[method].bind(f.core)
+      t.mock.method(f.core, method, async (...args) => {
+        if (!injected) { injected = true; throw new Error('fixture: ' + fault + ' failed') }
+        return original(...args)
+      })
+    } else {
+      const write = fs.writeFileSync
+      t.mock.method(fs, 'writeFileSync', (file, ...args) => {
+        const matches = fault === 'journal write' ? file === f.core.transactionFile + '.next' :
+          file === f.core.updateStatusFile + '.next' && (f.core.maintenance.blockIngress || injected)
+        if (matches) { injected = true; throw new Error('fixture: ' + fault + ' failed') }
+        return write(file, ...args)
+      })
+    }
+    await action(f.core, 'update', '2099.1.1')
+    assert.equal(injected, true)
+    assert.equal(f.core.phase, 'running', f.core.tail())
+    assert.equal(f.core.version, CORE_VERSION)
+    assert.equal(f.core.available, true)
+    assert.equal(f.core.maintenance.blockIngress, false)
+    assert.equal(f.core.maintenance.stage, 'rolled-back')
+    assert.equal(fs.readFileSync(sample, 'utf8'), 'original data')
+    assert.equal(fs.existsSync(f.core.transactionFile), false)
+    const res = await fetch('http://127.0.0.1:' + f.port + UI_PATH + '/')
+    assert.match(await res.text(), /openclaw-app/)
+  })
+}
+
+test('persistent port conflicts keep ingress blocked until automatic recovery verifies service', async t => {
+  const f = await fixture(t)
+  f.install(CORE_VERSION)
+  f.install('2099.1.1')
+  await action(f.core, 'boot')
+  const stranger = http.createServer()
+  t.after(() => close(stranger))
+  const stop = f.core.stopCore.bind(f.core)
+  let injected = false
+  t.mock.method(f.core, 'stopCore', async () => {
+    await stop()
+    if (!injected) { injected = true; await listen(stranger, f.port) }
+  })
+  await action(f.core, 'update', '2099.1.1')
+  assert.equal(f.core.phase, 'retrying', f.core.tail())
+  assert.equal(f.core.available, false)
+  assert.equal(f.core.maintenance.blockIngress, true)
+  assert.equal(f.core.maintenance.stage, 'failed')
+  assert.equal(stranger.listening, true)
+  await close(stranger)
+  await until(f.core, () => f.core.available && !f.core.job)
+  assert.equal(f.core.version, CORE_VERSION)
+  assert.equal(f.core.maintenance.blockIngress, false)
+  assert.equal(f.core.maintenance.stage, 'rolled-back')
+  assert.equal(JSON.parse(fs.readFileSync(f.core.updateStatusFile, 'utf8')).blockIngress, false)
+})
+
+test('candidate ingress stays blocked until session and Doctor validation completes', async t => {
+  const f = await fixture(t)
+  f.install(CORE_VERSION)
+  f.install('2099.1.1')
+  await action(f.core, 'boot')
+  const rpc = f.core.rpc.bind(f.core)
+  let audited = false
+  t.mock.method(f.core, 'rpc', async (method, ...args) => {
+    if (method === 'sessions.list') {
+      audited = true
+      assert.equal(f.core.phase, 'running')
+      assert.equal(f.core.available, false)
+    }
+    return rpc(method, ...args)
+  })
+  await action(f.core, 'update', '2099.1.1')
+  assert.equal(audited, true)
+  assert.equal(f.core.available, true)
+  assert.equal(f.core.version, '2099.1.1')
+})
+
+test('a one-session response count is not reported as the total session count', async t => {
+  const f = await fixture(t)
+  t.mock.method(f.core, 'gatewayReady', async () => true)
+  t.mock.method(f.core, 'rpc', async () => ({ sessions: [{ key: 'example' }], count: 1 }))
+  t.mock.method(f.core, 'cliJSON', async () => ({ findings: [] }))
+  const report = await auditUpgrade(f.core, CORE_VERSION)
+  assert.equal(report.sessions, true)
+  assert.equal(Object.hasOwn(report, 'sessionCount'), false)
 })

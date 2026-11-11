@@ -99,7 +99,8 @@ export async function auditUpgrade(core, version) {
   if (!await core.gatewayReady({ verifyCore: true })) throw new Error('升级验收失败：网关或界面未就绪。')
   const sessions = await core.rpc('sessions.list', { limit: 1 }, { version })
   if (!Array.isArray(sessions.sessions)) throw new Error('升级验收失败：无法读取会话库。')
-  const result = { gateway: true, sessions: true, sessionCount: sessions.count ?? sessions.sessions.length, findings: [] }
+  // count is the size of this limited response, not the total session count.
+  const result = { gateway: true, sessions: true, findings: [] }
   try {
     const report = await core.cliJSON(version, ['doctor', '--lint', '--json'], { timeout: 60000, allowFailure: true })
     if (!Array.isArray(report.findings)) throw new Error('无法读取检查报告。')

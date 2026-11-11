@@ -123,6 +123,13 @@ export class Core {
     saveJSON(this.updateStatusFile, this.maintenance)
   }
 
+  finishMaintenance(value) {
+    // A status-file failure must not undo a verified recovery. updateProgress
+    // updates memory first, so the serving decision still reflects that recovery.
+    try { this.updateProgress(value) }
+    catch (error) { this.log('无法保存维护结果：' + error.message) }
+  }
+
   async cliJSON(version, args, { timeout = 15000, allowFailure = false } = {}) {
     const child = spawn(process.execPath, [this.gatewayEntry(version), ...args], {
       env: { ...this.env, OPENCLAW_SUPERVISOR_MODE: 'external' }, cwd: this.env.HOME,
@@ -178,10 +185,9 @@ export class Core {
   pruneSnapshots() {
     // Only newly verified snapshots are managed. Preserve legacy/unregistered data.
     const protectedNames = new Set([readJSON(this.activeFile)?.snapshot, readJSON(this.transactionFile)?.snapshot])
-    const records = (readJSON(this.snapshotsFile) ?? []).sort((a, b) => b.createdAt - a.createdAt)
-    const keep = new Set(records.slice(0, 3).map(item => item.name))
+    const records = readJSON(this.snapshotsFile) ?? []
     for (const item of records) {
-      if (keep.has(item.name) || protectedNames.has(item.name) || !snapshotName(item.name)) continue
+      if (protectedNames.has(item.name) || !snapshotName(item.name)) continue
       const target = path.join(this.data, item.name)
       if (fs.existsSync(target) && !fs.lstatSync(target).isSymbolicLink()) fs.rmSync(target, { recursive: true })
     }
@@ -357,6 +363,13 @@ export class Core {
     this.failure = ''
     this.readySince = performance.now()
     this.generation += 1
+    if (this.maintenance?.blockIngress && !this.switchingUpdate) {
+      this.finishMaintenance({
+        blockIngress: false,
+        stage: this.maintenance.target === this.version ? 'complete' : 'rolled-back',
+        message: '当前版本已恢复就绪，入口已重新开放。',
+      })
+    }
     this.log('OpenClaw 已就绪。')
   }
 
@@ -532,17 +545,18 @@ export class Core {
       return
     }
     if (!await prepareUpgrade(this, { force })) return
-    this.updateProgress({ stage: 'snapshot', message: '正在备份并校验数据。', blockIngress: true })
-    await this.stopCore()
-    await this.assertPortFree()
-    if (this.closing) return
-    this.recoverUpdate()
-    const snapshot = 'snapshot-' + randomBytes(8).toString('hex')
-    const backup = path.join(this.data, snapshot)
     const previous = this.version
-    fs.mkdirSync(this.stateDir, { recursive: true, mode: 0o700 })
-    saveJSON(this.transactionFile, { target, previous, snapshot })
+    this.switchingUpdate = true
     try {
+      this.updateProgress({ stage: 'snapshot', message: '正在备份并校验数据。', blockIngress: true })
+      await this.stopCore()
+      await this.assertPortFree()
+      if (this.closing) return
+      this.recoverUpdate()
+      const snapshot = 'snapshot-' + randomBytes(8).toString('hex')
+      const backup = path.join(this.data, snapshot)
+      fs.mkdirSync(this.stateDir, { recursive: true, mode: 0o700 })
+      saveJSON(this.transactionFile, { target, previous, snapshot })
       fs.renameSync(this.stateDir, backup)
       const verified = await inspectTree(backup)
       const source = restore ? path.join(this.data, restore.name) : backup
@@ -561,16 +575,29 @@ export class Core {
     } catch (error) {
       if (this.version === target) {
         this.log('版本已提交，保存验收报告失败：' + error.message)
-        this.maintenance.blockIngress = false
-        return
+        if (this.phase === 'running' && await this.gatewayReady()) {
+          this.finishMaintenance({ stage: 'complete', blockIngress: false, message: '版本已切换并就绪，保存验收报告时发生错误。' })
+          return
+        }
+        this.finishMaintenance({ stage: 'failed', blockIngress: true, message: '版本已提交，但网关尚未恢复就绪。' })
+        throw error
       }
       this.log(error.message)
-      await this.stopCore()
-      await this.assertPortFree()
-      this.recoverUpdate()
-      if (!this.closing) await this.startCore(previous)
-      this.updateProgress({ stage: 'rolled-back', blockIngress: false, message: '切换失败，已恢复旧版。' + error.message })
+      try {
+        await this.stopCore()
+        await this.assertPortFree()
+        this.recoverUpdate()
+        if (!this.closing) await this.startCore(previous)
+        if (this.phase === 'running' && !this.closing) {
+          this.finishMaintenance({ stage: 'rolled-back', blockIngress: false, message: '切换失败，已恢复旧版。' + error.message })
+        }
+      } catch (recoveryError) {
+        this.finishMaintenance({ stage: 'failed', blockIngress: true, message: '切换失败，旧版尚未恢复就绪。' + recoveryError.message })
+        throw new Error(error.message + ' 恢复失败：' + recoveryError.message)
+      }
       return
+    } finally {
+      this.switchingUpdate = false
     }
     this.log('已切换到 OpenClaw ' + target + '。')
     // The version switch is committed. Cleanup errors must never start the old runtime on the new state.
