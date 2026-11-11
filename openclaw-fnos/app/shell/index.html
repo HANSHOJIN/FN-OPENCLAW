@@ -25,7 +25,20 @@
     <p id="gateway-notice" hidden></p>
     <section id="console" aria-label="控制台">
       <pre id="log" tabindex="0" aria-label="运行日志">__FN_OPENCLAW_LOG__</pre>
-      <section id="console-actions" aria-label="预留操作区"></section>
+      <section id="console-actions" aria-label="控制台操作">
+        <dl id="console-versions">
+          <div><dt>本机框架</dt><dd id="framework-version">读取中…</dd></div>
+          <div><dt>当前内核</dt><dd id="core-version">读取中…</dd></div>
+          <div><dt>上游正式版</dt><dd id="upstream-version">尚未检测</dd></div>
+        </dl>
+        <div class="console-buttons">
+          <button id="check-upstream">检测上游版本</button>
+          <button id="console-update" disabled>更新内核</button>
+          <button id="console-rollback" disabled>回滚上次快照</button>
+        </div>
+        <p id="upstream-result" role="status"></p>
+        <p id="console-maintenance" role="status"></p>
+      </section>
     </section>
     <iframe id="control" title="OpenClaw Control UI" hidden></iframe>
   </main>

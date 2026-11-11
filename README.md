@@ -10,15 +10,17 @@
 
 [下载安装包](https://github.com/HANSHOJIN/FN-OPENCLAW/releases) · [问题反馈](https://github.com/HANSHOJIN/FN-OPENCLAW/issues) · [OpenClaw 上游](https://github.com/openclaw/openclaw)
 
-![OpenClaw 在飞牛桌面中的运行界面，顶部可见停止、重启、日志和独立打开按钮](assets/openclaw-fnos-desktop.png)
+![OpenClaw 在飞牛桌面中的运行界面](assets/openclaw-fnos-desktop.png)
 
 <img src="assets/openclaw-fnos-mobile.png" width="300" alt="OpenClaw 在飞牛手机 App 中的会话界面，会话名称和标识已脱敏">
 
 手机端演示图基于飞牛手机 App 实机截图，已脱敏。
 
-## 开发中（尚未打包）
+## 本版更新
 
-当前源码准备为 **2026.11.3-1**：全新安装默认下载 OpenClaw **2026.11.3**，已有实例保留当前核心版本。顶部操作收纳进「菜单」，「日志」改为「控制台」；日志区占约 2/3 高度，下方约 1/3 预留操作区。
+本版为 **2026.11.3-1**：全新安装默认下载 OpenClaw **2026.11.3**，已有实例保留当前核心版本。顶部操作收纳进「菜单」，「日志」改为「控制台」；日志区占约 2/3 高度，下方约 1/3 显示版本信息和操作按钮。
+
+控制台显示本机框架、当前内核及上游正式版，并提供检测、更新内核和回滚上次快照入口。版本检测只查询 npm 上的 OpenClaw 正式版信息，不会自动安装；Agent 也可以通过下列命令使用同一套流程。
 
 手机内网入口的兼容调整仍待飞牛手机 App 实机复测。
 
@@ -31,9 +33,9 @@
 
 ## 安装与使用
 
-当前发布版为 **2026.11.2-13**，适用于 **x86_64** 飞牛设备，初始 OpenClaw 核心为 **2026.11.2**。
+当前发布版为 **2026.11.3-1**，适用于 **x86_64** 飞牛设备，初始 OpenClaw 核心为 **2026.11.3**。
 
-1. 从 [v2026.11.2-13 发布页](https://github.com/HANSHOJIN/FN-OPENCLAW/releases/tag/v2026.11.2-13) 下载 `OpenClaw-fnOS-2026.11.2-13-x86_64.fpk`。
+1. 从 [v2026.11.3-1 发布页](https://github.com/HANSHOJIN/FN-OPENCLAW/releases/tag/v2026.11.3-1) 下载 `OpenClaw-fnOS-2026.11.3-1-x86_64.fpk`。
 2. 在飞牛应用中心选择 **手动安装**，上传 FPK。升级同一应用时直接覆盖安装。
 3. 从飞牛桌面打开 **OpenClaw**。首次启动需要连接 npm Registry 下载核心和依赖，进度可在日志里查看。
 4. 界面打开后，在 OpenClaw 内连接自己的模型，再开始对话。
@@ -86,12 +88,13 @@ Gateway 把整进程重启交给应用壳时，或进程意外退出时，应用
 
 ```sh
 /var/apps/openclaw-fnos/target/bin/fn-openclaw-core status
+/var/apps/openclaw-fnos/target/bin/fn-openclaw-core check-updates
 /var/apps/openclaw-fnos/target/bin/fn-openclaw-core update VERSION
 ```
 
 把 `VERSION` 换成目标版本号。程序会先下载候选版本，再停止网关并备份应用状态。候选网关和 Control UI 就绪后切换。候选启动失败时会恢复状态备份并尝试启动旧版。进度和错误可以在日志里查看。
 
-开发中的框架会在下载后先请求 Gateway 维护窗口，等待活动任务和终端结束，等待超时则暂缓更新，当前版本继续运行。「菜单 → 更新与快照」会显示进度、待完成任务数量及验收结果。只有明确勾选允许中断，或命令行追加 `--force`，才允许中断尚未结束的任务；待保存的数据仍须完成写入。[上游维护窗口接口](https://docs.openclaw.ai/gateway/external-apps)
+框架会在下载后先请求 Gateway 维护窗口，等待活动任务和终端结束，等待超时则暂缓更新，当前版本继续运行。「菜单 → 更新与快照」会显示进度、待完成任务数量及验收结果。只有明确勾选允许中断，或命令行追加 `--force`，才允许中断尚未结束的任务；待保存的数据仍须完成写入。[上游维护窗口接口](https://docs.openclaw.ai/gateway/external-apps)
 
 ```sh
 # 取消尚未开始切换的更新
@@ -103,6 +106,8 @@ Gateway 把整进程重启交给应用壳时，或进程意外退出时，应用
 ```
 
 切换前会比对状态副本的 SHA256；目标版本通过网关、界面和会话库读取检查后才开放访问。只读 Doctor 检查中的插件、技能等兼容性提示会单独显示，不会自动执行修复。验收失败时恢复旧核心及其状态。
+
+升级失败时框架会自动尝试回滚；控制台的「回滚上次快照」也支持 Gateway 停止或启动失败时手动恢复。手动回滚会校验所选快照、确认原 Gateway 停止及端口释放，备份当前状态，再恢复并启动快照对应版本。没有经过校验的快照时按钮不可用。
 
 快照显示大小和校验记录，并提供回退入口。成功切换后，仅保留**当前回滚点**及**未完成事务引用**的已登记快照。旧版未登记快照需单独确认后清理，不会自动删除。回退前会另外备份当前状态。快照仅涵盖应用 state 目录；通过符号链接指向的外部 workspace 文件不在备份范围内。回退后不会包含该快照之后的会话变动，原状态会留在新的快照中。
 
@@ -118,4 +123,4 @@ python scripts/build.py --fnpack /path/to/fnpack
 
 ## 自动化测试
 
-使用 Node.js 24 运行 `node --test test/core.test.mjs test/server.test.mjs`。测试使用临时数据目录和模拟 Gateway，覆盖进程恢复、维护停机、升级回滚和 FN Connect 中继访问。接替进程归属检测在 Linux 上执行。
+使用 Node.js 24 运行 `node --test test/core.test.mjs test/server.test.mjs test/versions.test.mjs`。测试使用临时数据目录和模拟 Gateway，覆盖进程恢复、维护停机、升级及离线回滚、版本检测和 FN Connect 中继访问。接替进程归属检测在 Linux 上执行。

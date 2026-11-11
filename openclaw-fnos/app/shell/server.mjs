@@ -182,7 +182,7 @@ function acceptAction(core, res, action, version, options) {
     json(res, 409, { error: 'Gateway 已手动停止。请在维护结束后启动，再更新核心。' })
     return false
   }
-  if (action === 'update' && version === core.version) {
+  if (['update', 'rollback'].includes(action) && version === core.version) {
     json(res, 409, { error: '已是指定版本。' })
     return false
   }
@@ -245,6 +245,10 @@ export function createServer(core, { desktopPort = FNOS_DESKTOP_PORT } = {}) {
       return res.end(fs.readFileSync(new URL('./' + name, import.meta.url)))
     }
     if (route === '/api/status' && req.method === 'GET') return json(res, 200, core.status())
+    if (route === '/api/upstream' && req.method === 'GET') {
+      return core.checkUpstream().then(value => json(res, 200, value))
+        .catch(() => json(res, 503, { error: '无法检测上游版本，请检查网络后重试；当前内核不会改变。' }))
+    }
     if (route === '/api/log' && req.method === 'GET') return json(res, 200, { log: core.tail() })
     if (route === '/api/snapshots' && req.method === 'GET') return json(res, 200, { snapshots: core.snapshots() })
     if (route === '/api/action' && req.method === 'POST') {
@@ -260,7 +264,7 @@ export function createServer(core, { desktopPort = FNOS_DESKTOP_PORT } = {}) {
       if (action === 'rollback') {
         const restore = core.snapshots().find(item => item.name === url.searchParams.get('snapshot') && item.rollbackAvailable)
         if (!restore) return json(res, 400, { error: '没有可校验的回退快照。' })
-        if (acceptAction(core, res, 'update', restore.version, { restore })) return json(res, 202, {})
+        if (acceptAction(core, res, 'rollback', restore.version, { restore })) return json(res, 202, {})
         return
       }
       if (!['start', 'stop', 'restart'].includes(action)) return json(res, 400, { error: '未知操作。' })
@@ -324,16 +328,20 @@ if (process.argv[1] && import.meta.url === pathToFileURL(path.resolve(process.ar
     if (!fs.lstatSync(adminSocket).isSocket()) throw new Error('Core control socket path is occupied')
     fs.unlinkSync(adminSocket)
   }
-  // Local CLI uses the package-owned socket; version changes are not browser actions.
+  // Local CLI and console share the same lifecycle controls.
   const admin = http.createServer(async (req, res) => {
     if (req.method === 'GET' && req.url === '/status') return json(res, 200, core.status())
     if (req.method === 'GET' && req.url === '/snapshots') return json(res, 200, { snapshots: core.snapshots() })
+    if (req.method === 'GET' && req.url === '/check-updates') {
+      try { return json(res, 200, await core.checkUpstream()) }
+      catch { return json(res, 503, { error: '无法检测上游版本，请检查网络后重试。' }) }
+    }
     if (req.method === 'POST' && req.url === '/cancel-update') { core.cancelUpdate = true; return json(res, 200, {}) }
     const localURL = requestURL(req)
     if (req.method === 'POST' && localURL?.pathname.startsWith('/rollback/')) {
       const restore = core.snapshots().find(item => item.name === localURL.pathname.slice('/rollback/'.length) && item.rollbackAvailable)
       if (!restore) return json(res, 400, { error: '没有可校验的回退快照。' })
-      if (acceptAction(core, res, 'update', restore.version, { restore })) return json(res, 202, {})
+      if (acceptAction(core, res, 'rollback', restore.version, { restore })) return json(res, 202, {})
       return
     }
     const action = req.url?.slice(1)

@@ -7,11 +7,12 @@ import { setTimeout as delay } from 'node:timers/promises'
 import { CORE_PORT, CORE_VERSION, UI_PATH } from './defaults.mjs'
 import { INSTANCE_ENV, findGatewayProcesses, isSameProcess, ownsGatewayListener } from './gateway-process.mjs'
 import { inspectTree, prepareUpgrade, auditUpgrade, snapshotName } from './maintenance.mjs'
+import { validVersion, frameworkVersion, compareVersions, UpstreamVersions } from './versions.mjs'
 
 const RETRY_DELAYS = [2000, 5000, 15000, 30000]
 const STABLE_UPTIME = 60000
 
-export const validVersion = value => /^\d{4}\.\d{1,2}\.\d{1,3}(?:-\d{1,3})?$/.test(value)
+export { validVersion } from './versions.mjs'
 
 function readJSON(file) {
   try { return JSON.parse(fs.readFileSync(file, 'utf8')) }
@@ -76,6 +77,8 @@ export class Core {
     this.generation = 0
     this.retryCount = 0
     this.failure = ''
+    this.frameworkVersion = frameworkVersion()
+    this.upstream = new UpstreamVersions()
     for (const dir of [data, config, home, this.runtimes]) fs.mkdirSync(dir, { recursive: true, mode: 0o700 })
     const tokenFile = path.join(config, 'gateway.token')
     if (!fs.existsSync(tokenFile)) fs.writeFileSync(tokenFile, randomBytes(32).toString('hex') + '\n', { flag: 'wx', mode: 0o600 })
@@ -176,6 +179,28 @@ export class Core {
     }).sort((a, b) => (b.createdAt || 0) - (a.createdAt || 0))
   }
 
+  rollbackPoint() {
+    try {
+      const name = readJSON(this.activeFile)?.snapshot
+      if (!snapshotName(name)) return null
+      const saved = (readJSON(this.snapshotsFile) ?? []).find(item => item.name === name)
+      if (!saved || !validVersion(saved.version) || saved.version === this.version || !/^[a-f0-9]{64}$/.test(saved.sha256)) return null
+      if (!fs.lstatSync(path.join(this.data, name)).isDirectory()) return null
+      return { name, version: saved.version, bytes: saved.bytes }
+    } catch { return null }
+  }
+
+  async checkUpstream() {
+    await this.upstream.check()
+    return this.upstreamStatus()
+  }
+
+  upstreamStatus() {
+    if (!this.upstream.cached) return null
+    const comparison = compareVersions(this.upstream.cached.latest, this.version)
+    return { ...this.upstream.cached, current: this.version, comparison, updateAvailable: comparison === 1 }
+  }
+
   async recordSnapshot(name, version, verification) {
     const records = readJSON(this.snapshotsFile) ?? []
     records.push({ name, version, createdAt: Date.now(), ...verification })
@@ -240,6 +265,8 @@ export class Core {
       paused: this.paused, failure: this.failure, retryAt: this.retryAt ?? null,
       retryExhausted: this.phase === 'failed' && !this.paused && this.retryCount >= RETRY_DELAYS.length,
       available: this.available, maintenance: this.maintenance ?? null,
+      frameworkVersion: this.frameworkVersion, rollback: this.rollbackPoint(),
+      upstream: this.upstreamStatus(),
     }
   }
 
@@ -518,7 +545,7 @@ export class Core {
     this.phase = 'stopped'
   }
 
-  async update(target, { force = false, restore } = {}) {
+  async update(target, { force = false, restore, allowOffline = false } = {}) {
     if (!validVersion(target)) throw new Error('版本格式无效。')
     if (target === this.version) throw new Error('已是指定版本。')
     this.cancelUpdate = false
@@ -544,10 +571,11 @@ export class Core {
       this.updateProgress({ stage: 'deferred', message: '已取消更新，当前版本继续运行。' })
       return
     }
-    if (!await prepareUpgrade(this, { force })) return
+    if (!(allowOffline && restore && this.phase !== 'running') && !await prepareUpgrade(this, { force })) return
     const previous = this.version
     this.switchingUpdate = true
     try {
+      if (allowOffline && restore) this.setPaused(false)
       this.updateProgress({ stage: 'snapshot', message: '正在备份并校验数据。', blockIngress: true })
       await this.stopCore()
       await this.assertPortFree()
@@ -613,9 +641,13 @@ export class Core {
     if (action === 'stop') this.setPaused(true)
     if (action === 'start' || action === 'restart') this.setPaused(false)
     this.cancelRecovery()
-    if (['start', 'stop', 'restart'].includes(action)) this.retryCount = 0
+    if (['start', 'stop', 'restart', 'rollback'].includes(action)) this.retryCount = 0
     this.job = Promise.resolve().then(async () => {
       if (action === 'update') return this.update(version, options)
+      if (action === 'rollback') {
+        if (!options?.restore) throw new Error('请选择已校验的回滚快照。')
+        return this.update(version, { ...options, allowOffline: true })
+      }
       const interrupted = fs.existsSync(this.transactionFile)
       if (!interrupted && !['stop', 'restart'].includes(action) && await this.adoptGateway()) return
       if (action === 'stop' || action === 'restart' || interrupted || this.gateway) await this.stopCore()

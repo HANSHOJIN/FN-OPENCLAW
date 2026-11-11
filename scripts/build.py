@@ -87,9 +87,12 @@ def verify(output):
             if member.mode != 0o755 or b'\r' in archive.extractfile(member).read():
                 raise ValueError('启动脚本权限或换行错误。')
         with tarfile.open(fileobj=archive.extractfile('app.tgz'), mode='r:gz') as app:
+            package_version = re.search(r'(?m)^version\s*=\s*(\S+)', manifest).group(1)
+            if app.extractfile('framework-version').read().decode('ascii').strip() != package_version:
+                raise ValueError('框架版本信息与安装包 manifest 不一致。')
             if app.getmember('bin/fn-openclaw-core').mode != 0o755:
                 raise ValueError('核心更新命令缺少执行权限。')
-            for file in ('ui/config', 'shell/server.mjs', 'shell/core.mjs', 'shell/index.html',
+            for file in ('ui/config', 'shell/server.mjs', 'shell/core.mjs', 'shell/versions.mjs', 'shell/maintenance.mjs', 'shell/index.html',
                          'shell/shell.js', 'shell/shell.css', 'shell/titlebar.js', 'shell/titlebar.css'):
                 app.getmember(file)
             runtime = app.extractfile('node-runtime.tar.gz')
@@ -113,6 +116,7 @@ def main():
         temp = Path(workspace)
         stage = temp / 'openclaw-fnos'
         shutil.copytree(ROOT / 'openclaw-fnos', stage)
+        (stage / 'app' / 'framework-version').write_text(PACKAGE_VERSION + '\n', encoding='ascii')
         shutil.copyfile(runtime, stage / 'app' / 'node-runtime.tar.gz')
         subprocess.run([str(fnpack), 'build', '--directory', str(stage)], cwd=stage, check=True)
         packages = list(stage.glob('*.fpk'))

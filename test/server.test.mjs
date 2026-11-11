@@ -13,7 +13,7 @@ async function listen(t, server) {
   return server.address().port
 }
 
-async function fixture(t) {
+async function fixture(t, overrides = {}) {
   const upstream = http.createServer((req, res) => {
     res.writeHead(200, { 'content-type': 'text/javascript' })
     res.end('export const ready = true')
@@ -22,12 +22,14 @@ async function fixture(t) {
     socket.end('HTTP/1.1 101 Switching Protocols\r\nConnection: Upgrade\r\nUpgrade: websocket\r\n\r\n')
   })
   const port = await listen(t, upstream)
-  const shell = await listen(t, createServer({ port, token: 'test-token', phase: 'running' }))
-  return (path, headers) => new Promise((resolve, reject) => {
-    const req = http.request({ host: '127.0.0.1', port: shell, path, headers })
+  const shell = await listen(t, createServer({ port, token: 'test-token', phase: 'running', ...overrides }))
+  return (path, headers, method = 'GET') => new Promise((resolve, reject) => {
+    const req = http.request({ host: '127.0.0.1', port: shell, path, headers, method })
     req.on('response', res => {
-      res.resume()
-      res.once('end', () => resolve(res))
+      let text = ''
+      res.setEncoding('utf8')
+      res.on('data', chunk => { text += chunk })
+      res.once('end', () => resolve(Object.assign(res, { text })))
       res.once('error', reject)
     })
     req.on('upgrade', (res, socket) => {
@@ -155,4 +157,40 @@ test('native HTTPS navigation can bootstrap proof when the WebView omits Fetch M
   assert.equal((await request(asset, { ...module, cookie, 'sec-fetch-site': 'cross-site' })).statusCode, 403)
   const bad = await request(PREFIX + '/open', { ...ingress, referer: origin + '/another-app/' })
   assert.equal(bad.headers['set-cookie'], undefined)
+})
+
+test('upstream discovery works with a stopped core and retains admin and origin checks', async t => {
+  let calls = 0
+  const request = await fixture(t, { phase: 'stopped', checkUpstream: async () => {
+    calls++
+    return { latest: '2026.11.4', current: '2026.11.3', updateAvailable: true }
+  } })
+  const response = await request(PREFIX + '/api/upstream', admin)
+  assert.equal(response.statusCode, 200)
+  assert.equal(JSON.parse(response.text).latest, '2026.11.4')
+  assert.equal(calls, 1)
+  assert.equal((await request(PREFIX + '/api/upstream', {})).statusCode, 403)
+  assert.equal((await request(PREFIX + '/api/upstream', { ...admin, origin: 'https://unrelated.test', 'sec-fetch-site': 'cross-site' })).statusCode, 403)
+  assert.equal(calls, 1)
+})
+
+test('upstream lookup failures return a clear error without exposing internal diagnostics', async t => {
+  const request = await fixture(t, { checkUpstream: async () => { throw new Error('private diagnostic') } })
+  const response = await request(PREFIX + '/api/upstream', admin)
+  assert.equal(response.statusCode, 503)
+  assert.match(JSON.parse(response.text).error, /无法检测上游版本/)
+  assert.doesNotMatch(response.text, /private diagnostic/)
+})
+
+test('the console can request the same verified rollback while the Gateway is paused', async t => {
+  const restore = { name: 'snapshot-aaaaaaaaaaaaaaaa', version: '2026.11.3', rollbackAvailable: true }
+  let captured
+  const request = await fixture(t, {
+    phase: 'stopped', paused: true, version: '2099.1.1', snapshots: () => [restore],
+    action: (...args) => { captured = args; return true },
+  })
+  const response = await request(PREFIX + '/api/action?action=rollback&snapshot=' + restore.name,
+    { ...admin, 'x-fn-openclaw-action': '1' }, 'POST')
+  assert.equal(response.statusCode, 202)
+  assert.deepEqual(captured, ['rollback', restore.version, { restore }])
 })

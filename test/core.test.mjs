@@ -8,6 +8,7 @@ import { test } from 'node:test'
 import { Core } from '../openclaw-fnos/app/shell/core.mjs'
 import { CORE_VERSION, UI_PATH } from '../openclaw-fnos/app/shell/defaults.mjs'
 import { prepareUpgrade, auditUpgrade } from '../openclaw-fnos/app/shell/maintenance.mjs'
+import { UpstreamVersions } from '../openclaw-fnos/app/shell/versions.mjs'
 
 async function listen(server, port = 0) {
   await new Promise((resolve, reject) => {
@@ -544,4 +545,79 @@ test('a one-session response count is not reported as the total session count', 
   const report = await auditUpgrade(f.core, CORE_VERSION)
   assert.equal(report.sessions, true)
   assert.equal(Object.hasOwn(report, 'sessionCount'), false)
+})
+
+test('version discovery is read-only and cached comparisons follow the active core', async t => {
+  const f = await fixture(t)
+  f.core.upstream = new UpstreamVersions({ fetcher: async () => Response.json({ name: 'openclaw', version: '2099.1.1' }) })
+  t.mock.method(f.core, 'install', () => assert.fail('a version check cannot install anything'))
+  const version = f.core.version
+  const result = await f.core.checkUpstream()
+  assert.equal(result.latest, '2099.1.1')
+  assert.equal(result.current, version)
+  assert.equal(result.updateAvailable, true)
+  assert.equal(f.core.phase, 'stopped')
+  assert.equal(f.core.version, version)
+  f.core.version = '2099.1.2'
+  assert.equal(f.core.status().upstream.updateAvailable, false)
+  assert.equal(f.core.status().upstream.comparison, -1)
+})
+
+for (const failed of [false, true]) {
+  test('manual rollback restores a verified snapshot when the Gateway is ' + (failed ? 'failing to start' : 'manually stopped'), async t => {
+    const f = await fixture(t)
+    const candidate = '2099.1.1'
+    f.install(CORE_VERSION)
+    f.install(candidate)
+    await action(f.core, 'boot')
+    const sample = path.join(f.core.stateDir, 'sample.txt')
+    fs.writeFileSync(sample, 'before upgrade')
+    await action(f.core, 'update', candidate)
+    fs.writeFileSync(sample, 'after upgrade')
+    const point = f.core.status().rollback
+    assert.equal(point.version, CORE_VERSION)
+    await action(f.core, 'stop')
+    if (failed) {
+      f.install(candidate, 'fail')
+      await action(f.core, 'start')
+      assert.equal(f.core.phase, 'retrying')
+    } else assert.equal(f.core.paused, true)
+    const rpc = f.core.rpc.bind(f.core)
+    t.mock.method(f.core, 'rpc', (method, ...args) => {
+      assert.ok(!method.startsWith('gateway.suspend.'), 'offline rollback cannot depend on a running Gateway')
+      return rpc(method, ...args)
+    })
+    const restore = f.core.snapshots().find(item => item.name === point.name)
+    assert.equal(f.core.action('rollback', restore.version, { restore }), true)
+    await f.core.job
+    assert.equal(f.core.phase, 'running', f.core.tail())
+    assert.equal(f.core.available, true)
+    assert.equal(f.core.version, CORE_VERSION)
+    assert.equal(f.core.paused, false)
+    assert.equal(fs.readFileSync(sample, 'utf8'), 'before upgrade')
+    assert.equal(f.core.status().rollback.version, candidate)
+  })
+}
+
+test('offline rollback does not replace state or stop an unrelated listener', async t => {
+  const f = await fixture(t)
+  const candidate = '2099.1.1'
+  f.install(CORE_VERSION)
+  f.install(candidate)
+  await action(f.core, 'boot')
+  await action(f.core, 'update', candidate)
+  const restore = f.core.snapshots()[0]
+  await action(f.core, 'stop')
+  const sample = path.join(f.core.stateDir, 'sample.txt')
+  fs.writeFileSync(sample, 'current state must survive')
+  const stranger = http.createServer()
+  await listen(stranger, f.port)
+  t.after(() => close(stranger))
+  assert.equal(f.core.action('rollback', restore.version, { restore }), true)
+  await f.core.job
+  assert.equal(f.core.available, false)
+  assert.equal(f.core.version, candidate)
+  assert.equal(stranger.listening, true)
+  assert.equal(fs.readFileSync(sample, 'utf8'), 'current state must survive')
+  assert.equal(fs.existsSync(path.join(f.core.data, restore.name)), true)
 })

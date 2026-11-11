@@ -23,6 +23,10 @@ let generation
 let pending = false
 let connectionError = ''
 let actionError = ''
+let upstream
+let checkingUpstream = false
+let checkedUpstream = false
+let upstreamError = ''
 
 function scrollLogToEnd() {
   log.scrollTop = log.scrollHeight
@@ -78,13 +82,33 @@ function render() {
   byId('audit-summary').textContent = update?.audit ? 'Gateway 与会话库读取通过。兼容性提示：' + findings.length + ' 项。\n' + findings.map(f => (f.severity === 'error' ? '错误：' : '提示：') + f.message).join('\n') : ''
   byId('apply-update').disabled = locked || !running
   byId('cancel-update').disabled = !status?.busy || !['downloading', 'waiting'].includes(update?.stage)
+  byId('framework-version').textContent = status?.frameworkVersion && status.frameworkVersion !== 'unknown' ? status.frameworkVersion : '未知'
+  byId('core-version').textContent = status?.version || '未知'
+  const versions = status?.upstream || upstream
+  byId('upstream-version').textContent = versions?.latest || (checkingUpstream ? '检测中…' : '尚未检测')
+  byId('check-upstream').disabled = !status || checkingUpstream
+  const canUpdate = versions?.current === status?.version && versions?.updateAvailable
+  byId('console-update').disabled = locked || !running || !canUpdate
+  byId('console-update').title = !running ? '启动服务后可更新内核' : !canUpdate ? '检测到新版本后可更新' : '更新到 ' + versions.latest
+  byId('console-rollback').disabled = locked || !status?.rollback
+  byId('console-rollback').title = status?.rollback ? '恢复到 ' + status.rollback.version + ' 并启动' : '暂无经过校验的上次回滚快照'
+  const result = checkingUpstream ? '正在检测上游正式版本…' : upstreamError ||
+    (versions ? (versions.current !== status?.version ? '内核版本已变化，请重新检测。' : canUpdate ? '可更新到 ' + versions.latest : versions.comparison === -1 ? '当前内核高于上游正式版本。' : '当前已是最新内核。') +
+      (Number.isFinite(versions.checkedAt) ? ' 检测时间：' + new Date(versions.checkedAt).toLocaleString() : '') : '尚未检测上游版本。')
+  byId('upstream-result').textContent = result
+  byId('console-maintenance').textContent = update?.message || ''
+  if (!consolePanel.hidden && status && !checkedUpstream) {
+    checkedUpstream = true
+    queueMicrotask(checkUpstream)
+  }
 }
 
 async function api(path, options) {
+  const { timeoutMs = 5000, ...requestOptions } = options || {}
   const controller = new AbortController()
-  const timeout = setTimeout(() => controller.abort(), 5000)
+  const timeout = setTimeout(() => controller.abort(), timeoutMs)
   try {
-    const response = await fetch('./api/' + path, { cache: 'no-store', signal: controller.signal, ...options })
+    const response = await fetch('./api/' + path, { cache: 'no-store', signal: controller.signal, ...requestOptions })
     if (!response.ok) throw new Error((await response.json().catch(() => ({}))).error || '无法连接应用壳。')
     if (!response.headers.get('content-type')?.includes('application/json')) throw new Error('飞牛登录未通过，请从桌面重新打开应用。')
     return await response.json()
@@ -133,6 +157,31 @@ async function action(name, params = {}) {
 power.addEventListener('click', () => action(canStop() ? 'stop' : 'start'))
 restart.addEventListener('click', () => action('restart'))
 logs.addEventListener('click', () => { showLogs = !showLogs; render() })
+
+async function checkUpstream() {
+  if (checkingUpstream) return
+  checkedUpstream = true
+  checkingUpstream = true
+  upstreamError = ''
+  render()
+  try { upstream = await api('upstream', { timeoutMs: 12000 }) }
+  catch (error) { upstreamError = error.message }
+  finally { checkingUpstream = false; render() }
+}
+byId('check-upstream').addEventListener('click', checkUpstream)
+byId('console-update').addEventListener('click', () => {
+  const versions = status?.upstream || upstream
+  if (!versions?.updateAvailable || versions.current !== status?.version) return
+  byId('target-version').value = versions.latest
+  byId('force-update').checked = false
+  showMaintenance()
+})
+byId('console-rollback').addEventListener('click', () => {
+  const point = status?.rollback
+  if (!point || status.busy) return
+  if (!window.confirm('恢复到 ' + point.version + ' 的上次快照并启动？快照之后的会话变动将先备份，之后可通过新快照找回。')) return
+  action('rollback', { snapshot: point.name })
+})
 
 function closeMenu() { menuPanel.hidePopover() }
 menuToggle.addEventListener('click', () => {
