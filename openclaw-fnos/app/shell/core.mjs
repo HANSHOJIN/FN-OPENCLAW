@@ -6,6 +6,7 @@ import net from 'node:net'
 import { setTimeout as delay } from 'node:timers/promises'
 import { CORE_PORT, CORE_VERSION, UI_PATH } from './defaults.mjs'
 import { INSTANCE_ENV, findGatewayProcesses, isSameProcess, ownsGatewayListener } from './gateway-process.mjs'
+import { inspectTree, prepareUpgrade, auditUpgrade, snapshotName } from './maintenance.mjs'
 
 const RETRY_DELAYS = [2000, 5000, 15000, 30000]
 const STABLE_UPTIME = 60000
@@ -67,6 +68,8 @@ export class Core {
     this.transactionFile = path.join(data, 'update.json')
     this.ownerFile = path.join(data, 'gateway-owner.json')
     this.pauseFile = path.join(data, 'gateway-stopped')
+    this.updateStatusFile = path.join(data, 'update-status.json')
+    this.snapshotsFile = path.join(data, 'snapshots.json')
     this.paused = fs.existsSync(this.pauseFile)
     this.npm = npm
     this.phase = 'stopped'
@@ -93,8 +96,96 @@ export class Core {
         .filter(Boolean).join(path.delimiter),
       ...(ca ? { NODE_EXTRA_CA_CERTS: ca } : {}),
     }
-    this.version = readJSON(this.activeFile)?.version ?? CORE_VERSION
+    // Installing a new shell must not silently upgrade an existing instance.
+    const active = readJSON(this.activeFile)
+    const interrupted = readJSON(this.transactionFile)
+    const legacyVersion = '2026.11.2'
+    const existingVersion = fs.existsSync(this.stateDir) ? readJSON(this.ownerFile)?.version ??
+      (fs.existsSync(path.join(this.runtimes, legacyVersion, 'installed')) ? legacyVersion : undefined) : undefined
+    // An old interrupted transaction may have overwritten gateway-owner.json
+    // with the candidate. That is not evidence of a committed version switch.
+    this.version = active?.version ?? (interrupted ? interrupted.previous ?? legacyVersion : existingVersion) ?? CORE_VERSION
     if (!validVersion(this.version)) throw new Error('运行版本记录无效。')
+    this.maintenance = readJSON(this.updateStatusFile)
+    if (this.maintenance) {
+      this.maintenance.blockIngress = false
+      if (!['complete', 'deferred', 'failed', 'rolled-back'].includes(this.maintenance.stage)) {
+        this.maintenance.stage = 'interrupted'
+        this.maintenance.message = '上次更新中断，请核对当前版本和日志。'
+      }
+    }
+  }
+
+  get available() { return this.phase === 'running' && !this.maintenance?.blockIngress }
+
+  updateProgress(value) {
+    this.maintenance = { ...this.maintenance, ...value, updatedAt: Date.now() }
+    saveJSON(this.updateStatusFile, this.maintenance)
+  }
+
+  async cliJSON(version, args, { timeout = 15000, allowFailure = false } = {}) {
+    const child = spawn(process.execPath, [this.gatewayEntry(version), ...args], {
+      env: { ...this.env, OPENCLAW_SUPERVISOR_MODE: 'external' }, cwd: this.env.HOME,
+      detached: process.platform !== 'win32', windowsHide: true, stdio: ['ignore', 'pipe', 'pipe'],
+    })
+    this.inspector = child
+    let output = ''
+    let bytes = 0
+    let overflow = false
+    let expired = false
+    const timer = setTimeout(() => { expired = true; void this.stopChild(child).catch(() => {}) }, timeout)
+    child.stdout.setEncoding('utf8')
+    child.stdout.on('data', chunk => {
+      bytes += Buffer.byteLength(chunk)
+      if (bytes > 1024 * 1024) { overflow = true; void this.stopChild(child).catch(() => {}); return }
+      output += chunk
+    })
+    child.stderr.resume() // CLI diagnostics may contain private paths; never forward raw output.
+    try {
+      const code = await new Promise((resolve, reject) => {
+        child.once('error', reject)
+        child.once('close', resolve)
+      })
+      if (expired || overflow || (code !== 0 && !allowFailure)) throw new Error('CLI 检查失败或超时。')
+      return JSON.parse(output)
+    } finally {
+      clearTimeout(timer)
+      if (this.inspector === child) this.inspector = undefined
+    }
+  }
+
+  rpc(method, params = {}, { version = this.version, timeout = 15000 } = {}) {
+    const url = 'ws://127.0.0.1:' + this.port
+    return this.cliJSON(version, ['gateway', 'call', method, '--expect-url', url,
+      '--params', JSON.stringify(params), '--json', '--timeout', String(timeout)], { timeout: timeout + 5000 })
+  }
+
+  snapshots() {
+    const records = readJSON(this.snapshotsFile) ?? []
+    return fs.readdirSync(this.data).filter(snapshotName).flatMap(name => {
+      if (!fs.lstatSync(path.join(this.data, name)).isDirectory()) return []
+      const saved = records.find(item => item.name === name)
+      return [{ name, ...saved, verified: Boolean(saved?.sha256), rollbackAvailable: Boolean(saved?.sha256 && validVersion(saved.version)) }]
+    }).sort((a, b) => (b.createdAt || 0) - (a.createdAt || 0))
+  }
+
+  async recordSnapshot(name, version, verification) {
+    const records = readJSON(this.snapshotsFile) ?? []
+    records.push({ name, version, createdAt: Date.now(), ...verification })
+    saveJSON(this.snapshotsFile, records)
+  }
+
+  pruneSnapshots() {
+    // Only newly verified snapshots are managed. Preserve legacy/unregistered data.
+    const protectedNames = new Set([readJSON(this.activeFile)?.snapshot, readJSON(this.transactionFile)?.snapshot])
+    const records = (readJSON(this.snapshotsFile) ?? []).sort((a, b) => b.createdAt - a.createdAt)
+    const keep = new Set(records.slice(0, 3).map(item => item.name))
+    for (const item of records) {
+      if (keep.has(item.name) || protectedNames.has(item.name) || !snapshotName(item.name)) continue
+      const target = path.join(this.data, item.name)
+      if (fs.existsSync(target) && !fs.lstatSync(target).isSymbolicLink()) fs.rmSync(target, { recursive: true })
+    }
+    saveJSON(this.snapshotsFile, records.filter(item => fs.existsSync(path.join(this.data, item.name))))
   }
 
   recoverUpdate() {
@@ -142,6 +233,7 @@ export class Core {
       phase: this.phase, version: this.version, generation: this.generation, busy: Boolean(this.job),
       paused: this.paused, failure: this.failure, retryAt: this.retryAt ?? null,
       retryExhausted: this.phase === 'failed' && !this.paused && this.retryCount >= RETRY_DELAYS.length,
+      available: this.available, maintenance: this.maintenance ?? null,
     }
   }
 
@@ -359,6 +451,7 @@ export class Core {
     // Fail if someone else already owns this port, rather than proxying to them.
     await this.assertPortFree()
     if (this.closing) return
+    if (!fs.existsSync(this.activeFile)) saveJSON(this.activeFile, { version })
     const instance = randomBytes(16).toString('hex')
     saveJSON(this.ownerFile, { version, instance })
     this.log('启动 OpenClaw ' + version + '。')
@@ -412,16 +505,34 @@ export class Core {
     this.phase = 'stopped'
   }
 
-  async update(target) {
+  async update(target, { force = false, restore } = {}) {
+    if (!validVersion(target)) throw new Error('版本格式无效。')
     if (target === this.version) throw new Error('已是指定版本。')
+    this.cancelUpdate = false
+    this.maintenance = undefined
+    this.updateProgress({ stage: 'downloading', target, force, message: '正在准备目标版本。', blockIngress: false })
     // Install the candidate before taking the live state offline.
     let entry
-    try { entry = await this.install(target) }
+    try {
+      if (restore) {
+        if (!snapshotName(restore.name) || restore.version !== target || !restore.sha256) throw new Error('回退快照记录无效。')
+        const actual = await inspectTree(path.join(this.data, restore.name))
+        if (actual.sha256 !== restore.sha256) throw new Error('快照校验未通过，已取消回退。')
+      }
+      entry = await this.install(target)
+    }
     catch (error) {
+      this.updateProgress({ stage: 'failed', message: error.message })
       if (this.phase === 'running') { this.log(error.message); return }
       throw error
     }
     if (this.closing) return
+    if (this.cancelUpdate) {
+      this.updateProgress({ stage: 'deferred', message: '已取消更新，当前版本继续运行。' })
+      return
+    }
+    if (!await prepareUpgrade(this, { force })) return
+    this.updateProgress({ stage: 'snapshot', message: '正在备份并校验数据。', blockIngress: true })
     await this.stopCore()
     await this.assertPortFree()
     if (this.closing) return
@@ -430,29 +541,46 @@ export class Core {
     const backup = path.join(this.data, snapshot)
     const previous = this.version
     fs.mkdirSync(this.stateDir, { recursive: true, mode: 0o700 })
-    saveJSON(this.transactionFile, { target, snapshot })
+    saveJSON(this.transactionFile, { target, previous, snapshot })
     try {
       fs.renameSync(this.stateDir, backup)
-      await fs.promises.cp(backup, this.stateDir, { recursive: true, verbatimSymlinks: true })
+      const verified = await inspectTree(backup)
+      const source = restore ? path.join(this.data, restore.name) : backup
+      await fs.promises.cp(source, this.stateDir, { recursive: true, verbatimSymlinks: true })
+      const copied = await inspectTree(this.stateDir)
+      if (copied.sha256 !== (restore?.sha256 ?? verified.sha256)) throw new Error('数据副本校验失败。')
+      await this.recordSnapshot(snapshot, previous, verified)
+      this.updateProgress({ stage: 'starting', snapshot, bytes: verified.bytes, verified: true, message: '正在启动并验收目标版本。' })
       await this.startCore(target, entry, { verifyCore: true })
       if (this.phase !== 'running') throw new Error('候选版本未完成启动。')
+      const audit = await auditUpgrade(this, target)
       saveJSON(this.activeFile, { version: target, previous, snapshot })
+      // After active.json commits, recovery must never restore the predecessor.
+      this.version = target
+      this.updateProgress({ stage: 'complete', audit, blockIngress: false, message: '已完成切换和验收。' })
     } catch (error) {
+      if (this.version === target) {
+        this.log('版本已提交，保存验收报告失败：' + error.message)
+        this.maintenance.blockIngress = false
+        return
+      }
       this.log(error.message)
       await this.stopCore()
       await this.assertPortFree()
       this.recoverUpdate()
       if (!this.closing) await this.startCore(previous)
+      this.updateProgress({ stage: 'rolled-back', blockIngress: false, message: '切换失败，已恢复旧版。' + error.message })
       return
     }
-    this.version = target
     this.log('已切换到 OpenClaw ' + target + '。')
     // The version switch is committed. Cleanup errors must never start the old runtime on the new state.
     try { fs.unlinkSync(this.transactionFile) }
     catch (error) { this.log('升级已提交，暂未清理恢复记录。' + error.message) }
+    try { this.pruneSnapshots() }
+    catch (error) { this.log('暂未清理旧快照：' + error.message) }
   }
 
-  action(action, version) {
+  action(action, version, options) {
     if (this.job || this.closing || (this.paused && ['boot', 'recover', 'update'].includes(action))) return false
     if (action === 'start' && this.phase === 'running') return true
     if (action === 'stop') this.setPaused(true)
@@ -460,7 +588,7 @@ export class Core {
     this.cancelRecovery()
     if (['start', 'stop', 'restart'].includes(action)) this.retryCount = 0
     this.job = Promise.resolve().then(async () => {
-      if (action === 'update') return this.update(version)
+      if (action === 'update') return this.update(version, options)
       const interrupted = fs.existsSync(this.transactionFile)
       if (!interrupted && !['stop', 'restart'].includes(action) && await this.adoptGateway()) return
       if (action === 'stop' || action === 'restart' || interrupted || this.gateway) await this.stopCore()
@@ -496,6 +624,7 @@ export class Core {
     this.closing = true
     this.cancelRecovery()
     await this.stopChild(this.installer)
+    await this.stopChild(this.inspector)
     await this.job
     await this.stopCore()
   }

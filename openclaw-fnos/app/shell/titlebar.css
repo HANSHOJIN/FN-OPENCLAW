@@ -55,3 +55,22 @@
 [data-fn-openclaw-titlebar] :is(button:not(:disabled):hover, a[href]:hover, button[aria-pressed="true"]:not(:disabled)) {
   background: color-mix(in srgb, currentColor 12%, transparent);
 }
+[data-fn-openclaw-titlebar] #menu-panel {
+  position: fixed;
+  margin: 0;
+  min-width: 180px;
+  max-height: calc(100dvh - 16px);
+  overflow: auto;
+  padding: 6px;
+  border: 1px solid color-mix(in srgb, CanvasText 20%, Canvas);
+  border-radius: 8px;
+  background: Canvas;
+  color: CanvasText;
+  box-shadow: 0 8px 24px #0003;
+  color-scheme: inherit;
+}
+[data-fn-openclaw-titlebar][data-fn-openclaw-scheme="dark"] { color-scheme: dark; }
+[data-fn-openclaw-titlebar][data-fn-openclaw-scheme="light"] { color-scheme: light; }
+[data-fn-openclaw-titlebar] #menu-panel:not(:popover-open) { display: none; }
+[data-fn-openclaw-titlebar] #menu-panel:popover-open { display: flex; flex-direction: column; align-items: stretch; }
+[data-fn-openclaw-titlebar] #menu-panel > * { padding: 8px; text-align: left; }

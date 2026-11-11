@@ -2,12 +2,19 @@
 set -euo pipefail
 socket="${TRIM_PKGVAR:-/var/apps/openclaw-fnos/var}/run/core-control.sock"
 case "${1:-}" in
- status) exec curl --fail-with-body --silent --show-error --unix-socket "$socket" http://localhost/status ;;
- start|stop|restart) exec curl --fail-with-body --silent --show-error --unix-socket "$socket" -X POST "http://localhost/$1" ;;
+ status|snapshots) exec curl --fail-with-body --silent --show-error --unix-socket "$socket" "http://localhost/$1" ;;
+ start|stop|restart|cancel-update) exec curl --fail-with-body --silent --show-error --unix-socket "$socket" -X POST "http://localhost/$1" ;;
+ rollback)
+  [[ ${2:-} =~ ^snapshot-[a-f0-9]{16}$ ]] && [[ $# == 2 ]] || exit 2
+  exec curl --fail-with-body --silent --show-error --unix-socket "$socket" -X POST "http://localhost/rollback/$2"
+  ;;
  update)
   version=${2:-}
   [[ $version =~ ^[0-9]{4}\.[0-9]{1,2}\.[0-9]{1,3}(-[0-9]{1,3})?$ ]] || exit 2
-  exec curl --fail-with-body --silent --show-error --unix-socket "$socket" -X POST "http://localhost/update/$version"
+  extra=''
+  if [[ $# == 3 && $3 == --force ]]; then extra='?force=1'
+  elif [[ $# != 2 ]]; then exit 2; fi
+  exec curl --fail-with-body --silent --show-error --unix-socket "$socket" -X POST "http://localhost/update/$version$extra"
   ;;
- *) printf '%s\n' '用法：fn-openclaw-core status | start | stop | restart | update VERSION'; exit 2 ;;
+ *) printf '%s\n' '用法：fn-openclaw-core status | start | stop | restart | update VERSION [--force] | cancel-update | snapshots | rollback SNAPSHOT'; exit 2 ;;
 esac

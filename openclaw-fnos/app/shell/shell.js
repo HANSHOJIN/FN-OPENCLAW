@@ -9,7 +9,11 @@ const logs = byId('logs')
 const standalone = byId('standalone')
 const frame = byId('control')
 const log = byId('log')
+const consolePanel = byId('console')
 const notice = byId('gateway-notice')
+const menuToggle = byId('menu-toggle')
+const menuPanel = byId('menu-panel')
+const maintenance = byId('maintenance')
 const phases = __FN_OPENCLAW_PHASES__
 watchControlTheme(frame, toolbar)
 
@@ -40,16 +44,16 @@ function canStop() {
 
 function render() {
   dockToolbar()
-  const running = status?.phase === 'running'
+  const running = status?.phase === 'running' && status.available !== false
   const locked = pending || !status || status.busy
+  const update = status?.maintenance
   statusLabel.textContent = connectionError || actionError || statusText()
   toolbar.title = statusLabel.textContent
-  notice.hidden = !status?.failure
-  notice.textContent = notice.hidden ? '' : statusText()
+  notice.hidden = !status?.failure && !(status?.busy && ['downloading', 'waiting', 'snapshot', 'starting'].includes(update?.stage))
+  notice.textContent = status?.failure ? statusText() : update?.message || ''
   power.textContent = canStop() ? '停止' : '启动'
   power.disabled = locked
   restart.disabled = locked || !running
-  logs.disabled = !running
   if (running) standalone.href = standaloneURL
   else standalone.removeAttribute('href')
   standalone.setAttribute('aria-disabled', String(!running))
@@ -64,10 +68,16 @@ function render() {
     frame.src = './open'
   }
   const wasLogHidden = log.hidden
-  log.hidden = running && !showLogs
-  frame.hidden = !log.hidden
-  logs.setAttribute('aria-pressed', String(!log.hidden))
-  if (wasLogHidden && !log.hidden) scrollLogToEnd()
+  consolePanel.hidden = running && !showLogs
+  log.hidden = consolePanel.hidden
+  frame.hidden = !consolePanel.hidden
+  logs.setAttribute('aria-pressed', String(!consolePanel.hidden))
+  if (wasLogHidden && !consolePanel.hidden) scrollLogToEnd()
+  byId('update-status').textContent = update ? update.message + (Number.isFinite(update.activeCount) ? ' 活动任务：' + update.activeCount : '') : '尚未执行更新。'
+  const findings = update?.audit?.findings || []
+  byId('audit-summary').textContent = update?.audit ? 'Gateway 与会话库读取通过。兼容性提示：' + findings.length + ' 项。\n' + findings.map(f => (f.severity === 'error' ? '错误：' : '提示：') + f.message).join('\n') : ''
+  byId('apply-update').disabled = locked || !running
+  byId('cancel-update').disabled = !status?.busy || !['downloading', 'waiting'].includes(update?.stage)
 }
 
 async function api(path, options) {
@@ -107,11 +117,11 @@ async function refresh() {
   }
 }
 
-async function action(name) {
+async function action(name, params = {}) {
   pending = true
   actionError = ''
   render()
-  try { await api('action?action=' + name, { method: 'POST', headers: { 'X-FN-OpenClaw-Action': '1' } }) }
+  try { await api('action?' + new URLSearchParams({ action: name, ...params }), { method: 'POST', headers: { 'X-FN-OpenClaw-Action': '1' } }) }
   catch (error) { actionError = error.message }
   finally {
     await refresh()
@@ -123,6 +133,56 @@ async function action(name) {
 power.addEventListener('click', () => action(canStop() ? 'stop' : 'start'))
 restart.addEventListener('click', () => action('restart'))
 logs.addEventListener('click', () => { showLogs = !showLogs; render() })
+
+function closeMenu() { menuPanel.hidePopover() }
+menuToggle.addEventListener('click', () => {
+  if (menuPanel.matches(':popover-open')) return closeMenu()
+  const rect = menuToggle.getBoundingClientRect()
+  const viewport = toolbar.ownerDocument.defaultView
+  menuPanel.style.top = Math.max(8, Math.min(rect.bottom + 4, viewport.innerHeight - 230)) + 'px'
+  menuPanel.style.left = Math.max(8, Math.min(rect.right - 180, viewport.innerWidth - 188)) + 'px'
+  menuPanel.showPopover()
+})
+menuPanel.addEventListener('toggle', event => menuToggle.setAttribute('aria-expanded', String(event.newState === 'open')))
+menuPanel.addEventListener('click', event => { if (event.target.closest('button, a')) closeMenu() })
+
+async function showMaintenance() {
+  maintenance.showModal()
+  byId('snapshot-list').textContent = '正在读取快照…'
+  try {
+    const { snapshots } = await api('snapshots')
+    const container = byId('snapshot-list')
+    container.replaceChildren()
+    if (!snapshots.length) container.textContent = '暂无快照。'
+    for (const item of snapshots) {
+      const row = document.createElement('p')
+      const size = Number.isFinite(item.bytes) ? (item.bytes / 1024 ** 2).toFixed(1) + ' MB' : '大小未登记'
+      row.append((item.version || '旧版快照') + ' · ' + size + ' · ' + (item.verified ? 'SHA256 已登记' : '未校验'))
+      if (item.rollbackAvailable && item.version !== status?.version) {
+        const button = document.createElement('button')
+        button.textContent = '回退'
+        button.disabled = Boolean(status?.busy)
+        button.addEventListener('click', async () => {
+          if (!window.confirm('回退到 ' + item.version + ' 的状态？此快照之后的会话变动不会出现在回退后的实例中；当前状态将另行备份。')) return
+          await action('rollback', { snapshot: item.name })
+          button.disabled = true
+        })
+        row.append(button)
+      }
+      container.append(row)
+    }
+  } catch (error) { byId('snapshot-list').textContent = error.message }
+}
+byId('updates').addEventListener('click', showMaintenance)
+byId('close-maintenance').addEventListener('click', () => maintenance.close())
+byId('apply-update').addEventListener('click', () => {
+  const version = byId('target-version').value.trim()
+  if (!/^\d{4}\.\d{1,2}\.\d{1,3}(?:-\d{1,3})?$/.test(version)) { byId('update-status').textContent = '请填写有效版本号。'; return }
+  const force = byId('force-update').checked
+  if (force && !window.confirm('确定中断活动任务和终端，并切换版本？待保存数据仍须先完成写入。')) return
+  action('update', { version, force: force ? '1' : '0' })
+})
+byId('cancel-update').addEventListener('click', () => action('cancel-update'))
 
 async function poll() {
   await refresh()

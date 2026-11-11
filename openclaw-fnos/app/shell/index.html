@@ -11,19 +11,36 @@
   <div id="toolbar-slot">
     <div id="toolbar">
       <span id="status" role="status">__FN_OPENCLAW_STATUS__</span>
-      <nav aria-label="OpenClaw 操作">
+      <button id="menu-toggle" aria-expanded="false" aria-controls="menu-panel">菜单 ▾</button>
+      <nav id="menu-panel" popover="auto" aria-label="OpenClaw 操作">
         <button id="power" disabled>启动</button>
         <button id="restart" disabled>重启</button>
-        <button id="logs" aria-pressed="true" disabled>日志</button>
+        <button id="logs" aria-pressed="true">控制台</button>
         <a id="standalone" target="_blank" rel="noopener" aria-disabled="true">独立打开 ↗</a>
+        <button id="updates">更新与快照</button>
       </nav>
     </div>
   </div>
   <main>
     <p id="gateway-notice" hidden></p>
-    <pre id="log" tabindex="0" aria-label="运行日志">__FN_OPENCLAW_LOG__</pre>
+    <section id="console" aria-label="控制台">
+      <pre id="log" tabindex="0" aria-label="运行日志">__FN_OPENCLAW_LOG__</pre>
+      <section id="console-actions" aria-label="预留操作区"></section>
+    </section>
     <iframe id="control" title="OpenClaw Control UI" hidden></iframe>
   </main>
+  <dialog id="maintenance">
+    <header><h2>更新与快照</h2><button id="close-maintenance" aria-label="关闭">×</button></header>
+    <p id="update-status" role="status"></p>
+    <p id="audit-summary"></p>
+    <label>目标 OpenClaw 版本 <input id="target-version" placeholder="2026.11.3" inputmode="decimal"></label>
+    <p><label><input type="checkbox" id="force-update"> 允许中断仍在运行的任务和终端</label></p>
+    <div class="maintenance-buttons"><button id="apply-update">更新</button><button id="cancel-update">取消等待</button></div>
+    <p>默认等待活动任务结束；未能安全交接时保留当前版本。快照保存应用状态，不包含链接到外部的工作目录。</p>
+    <h3>回退快照</h3>
+    <p>自动保留最近 3 份经校验的快照；旧版遗留快照不自动删除。回退前还会备份当前状态。</p>
+    <div id="snapshot-list"></div>
+  </dialog>
   <script>__FN_OPENCLAW_SCRIPT__</script>
 </body>
 </html>

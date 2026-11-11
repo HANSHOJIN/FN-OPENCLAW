@@ -25,6 +25,22 @@ body {
   border-bottom: 1px solid color-mix(in srgb, CanvasText 16%, Canvas);
 }
 nav { display: flex; gap: 4px; }
+#menu-panel {
+  position: fixed;
+  margin: 0;
+  min-width: 180px;
+  max-height: calc(100dvh - 16px);
+  overflow: auto;
+  padding: 6px;
+  border: 1px solid color-mix(in srgb, CanvasText 20%, Canvas);
+  border-radius: 8px;
+  background: Canvas;
+  color: CanvasText;
+  box-shadow: 0 8px 24px #0003;
+}
+#menu-panel:not(:popover-open) { display: none; }
+#menu-panel:popover-open { display: flex; flex-direction: column; align-items: stretch; }
+#menu-panel > * { text-align: left; }
 button, a {
   font: inherit;
   color: inherit;
@@ -48,7 +64,10 @@ main { display: flex; flex-direction: column; min-height: 0; overflow: hidden; }
   font-weight: 600;
   overflow-wrap: anywhere;
 }
-main > :is(pre, iframe) { flex: 1; min-height: 0; }
+main > :is(section, iframe) { flex: 1; min-height: 0; }
+#console { display: grid; grid-template-rows: minmax(0, 2fr) minmax(0, 1fr); }
+#console[hidden] { display: none; }
+#console-actions { border-top: 1px solid color-mix(in srgb, CanvasText 16%, Canvas); }
 iframe { display: block; width: 100%; height: 100%; border: 0; }
 iframe[hidden] { display: none; }
 pre {
@@ -60,3 +79,21 @@ pre {
   overflow-wrap: anywhere;
   font: 13px/1.6 ui-monospace, monospace;
 }
+dialog {
+  width: min(640px, calc(100vw - 24px));
+  max-height: calc(100dvh - 24px);
+  overflow: auto;
+  padding: 20px;
+  border: 1px solid color-mix(in srgb, CanvasText 20%, Canvas);
+  border-radius: 10px;
+  background: Canvas;
+  color: CanvasText;
+}
+dialog::backdrop { background: #0006; }
+dialog header { display: flex; justify-content: space-between; align-items: center; }
+dialog h2 { margin: 0; font-size: 18px; }
+dialog p { white-space: pre-wrap; overflow-wrap: anywhere; }
+dialog input { font: inherit; color: inherit; background: Canvas; padding: 6px; }
+dialog button { border-color: color-mix(in srgb, CanvasText 24%, Canvas); }
+.maintenance-buttons { display: flex; gap: 8px; }
+#snapshot-list button { margin-inline-start: 8px; }

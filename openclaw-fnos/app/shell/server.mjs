@@ -1,6 +1,7 @@
 import http from 'node:http'
 import fs from 'node:fs'
 import path from 'node:path'
+import net from 'node:net'
 import { pathToFileURL } from 'node:url'
 import { createHash, createHmac, timingSafeEqual } from 'node:crypto'
 import { Core, validVersion } from './core.mjs'
@@ -38,6 +39,14 @@ function isForwardedRelay(req, origin) {
   return ['localhost', '127.0.0.1', '[::1]'].includes(host)
 }
 
+function isForwardedLAN(req, origin, desktopPort) {
+  if (origin.protocol !== 'http:' || origin.port !== String(desktopPort) || net.isIP(origin.hostname) !== 4) return false
+  const [a, b] = origin.hostname.split('.').map(Number)
+  if (!(a === 10 || (a === 172 && b >= 16 && b <= 31) || (a === 192 && b === 168))) return false
+  const host = new URL('http://' + req.headers.host).hostname
+  return ['localhost', '127.0.0.1', '[::1]'].includes(host) && req.headers['x-forwarded-proto'] === 'http'
+}
+
 function sameAppReferrer(req, origin) {
   const referrer = new URL(req.headers.referer)
   return referrer.origin === origin.origin &&
@@ -73,12 +82,36 @@ function originProof(req, core, origin) {
     .digest('hex')
 }
 
+function hasOriginProof(req, core) {
+  if (!req.headers.origin) return false
+  const proof = (req.headers.cookie || '').split(';').map(cookie => cookie.trim())
+    .find(cookie => cookie.startsWith(originCookie + '='))?.slice(originCookie.length + 1)
+  if (!proof || !/^[a-f\d]{64}$/.test(proof)) return false
+  return timingSafeEqual(Buffer.from(proof), Buffer.from(originProof(req, core, req.headers.origin)))
+}
+
+function httpOrigin(req, core, desktopPort) {
+  if (sameOrigin(req, desktopPort)) return true
+  if (req.headers['sec-fetch-site'] && req.headers['sec-fetch-site'] !== 'same-origin') return false
+  try {
+    const origin = new URL(req.headers.origin)
+    // HTTP WebViews can omit Fetch Metadata. A previously authenticated app
+    // navigation must have issued this origin-bound cookie before any fallback.
+    return (isForwardedRelay(req, origin) || isForwardedLAN(req, origin, desktopPort)) &&
+      sameAppReferrer(req, origin) && hasOriginProof(req, core)
+  } catch { return false }
+}
+
 function setOriginCookie(req, core, headers, desktopPort) {
   try {
     const source = new URL(req.headers.origin || req.headers.referer)
-    if (!sameOrigin({ headers: { ...req.headers, origin: source.origin } }, desktopPort)) return
+    const headersForOrigin = { headers: { ...req.headers, origin: source.origin } }
+    const site = req.headers['sec-fetch-site']
+    const forwardedNavigation = !req.headers.origin && req.method === 'GET' && (!site || site === 'same-origin') &&
+      (isForwardedLAN(req, source, desktopPort) || isForwardedRelay(req, source)) && sameAppReferrer(req, source)
+    if (!sameOrigin(headersForOrigin, desktopPort) && !forwardedNavigation && !httpOrigin(headersForOrigin, core, desktopPort)) return
     const proof = originProof(req, core, source.origin)
-    const cookie = `${originCookie}=${proof}; Path=${UI_PATH}; HttpOnly; SameSite=Strict` +
+    const cookie = `${originCookie}=${proof}; Path=${PREFIX}; HttpOnly; SameSite=Strict` +
       (source.protocol === 'https:' ? '; Secure' : '')
     headers['set-cookie'] = [...(headers['set-cookie'] || []), cookie]
   } catch { /* A later same-origin resource request can supply the origin. */ }
@@ -92,12 +125,9 @@ function websocketOrigin(req, core, desktopPort) {
   // require a proof issued to this admin on a same-origin HTTP request.
   try {
     if (!sameOrigin({ headers: { ...req.headers, 'sec-fetch-site': 'same-origin' } }, desktopPort) &&
-        !isForwardedRelay(req, new URL(req.headers.origin))) return false
+        !isForwardedRelay(req, new URL(req.headers.origin)) && !isForwardedLAN(req, new URL(req.headers.origin), desktopPort)) return false
   } catch { return false }
-  const proof = (req.headers.cookie || '').split(';').map(cookie => cookie.trim())
-    .find(cookie => cookie.startsWith(originCookie + '='))?.slice(originCookie.length + 1)
-  if (!proof || !/^[a-f\d]{64}$/.test(proof)) return false
-  return timingSafeEqual(Buffer.from(proof), Buffer.from(originProof(req, core, req.headers.origin)))
+  return hasOriginProof(req, core)
 }
 
 function requestURL(req) {
@@ -147,7 +177,7 @@ function proxyHTTP(req, res, url, core, desktopPort) {
   req.pipe(upstream)
 }
 
-function acceptAction(core, res, action, version) {
+function acceptAction(core, res, action, version, options) {
   if (action === 'update' && core.paused) {
     json(res, 409, { error: 'Gateway 已手动停止。请在维护结束后启动，再更新核心。' })
     return false
@@ -157,7 +187,7 @@ function acceptAction(core, res, action, version) {
     return false
   }
   try {
-    if (core.action(action, version)) return true
+    if (core.action(action, version, options)) return true
     json(res, 409, { error: '正在处理，请稍候。' })
   } catch (error) {
     core.log(error.message)
@@ -167,10 +197,24 @@ function acceptAction(core, res, action, version) {
 }
 
 export function createServer(core, { desktopPort = FNOS_DESKTOP_PORT } = {}) {
+  let lastRejection = 0
+  const rejected = req => {
+    if (!isAdmin(req) || Date.now() - lastRejection < 30000) return
+    lastRejection = Date.now()
+    // Deliberately omit origins, cookies, tokens and user/session identifiers.
+    core.log?.('入口来源校验拒绝请求：' + JSON.stringify({
+      transport: ['http', 'https'].includes(req.headers['x-forwarded-proto']) ? req.headers['x-forwarded-proto'] : 'missing/other',
+      fetchSite: ['same-origin', 'cross-site', 'same-site', 'none'].includes(req.headers['sec-fetch-site']) ? req.headers['sec-fetch-site'] : 'missing',
+      originPresent: Boolean(req.headers.origin), referrerPresent: Boolean(req.headers.referer), proofPresent: Boolean(req.headers.cookie?.includes(originCookie + '=')),
+    }))
+  }
   const server = http.createServer((req, res) => {
     const url = requestURL(req)
     if (!url || (url.pathname !== PREFIX && !url.pathname.startsWith(PREFIX + '/'))) return json(res, 404, { error: '路径不存在。' })
-    if (!isAdmin(req) || !sameOrigin(req, desktopPort)) return json(res, 403, { error: '请通过飞牛管理员入口访问。' })
+    if (!isAdmin(req) || !httpOrigin(req, core, desktopPort)) {
+      rejected(req)
+      return json(res, 403, { error: '请通过飞牛管理员入口访问。' })
+    }
     const route = url.pathname.slice(PREFIX.length)
     if (!route && req.method === 'GET') {
       res.writeHead(308, { location: PREFIX + '/' })
@@ -183,8 +227,10 @@ export function createServer(core, { desktopPort = FNOS_DESKTOP_PORT } = {}) {
         if (key === 'STATUS') return escapeHTML(phases[status.phase] + ' · ' + status.version)
         return escapeHTML(core.tail() || '暂无运行日志。')
       })
-      res.writeHead(200, { 'content-type': 'text/html; charset=utf-8', 'content-security-policy': shellCSP,
-        'x-content-type-options': 'nosniff', 'referrer-policy': 'same-origin', 'cache-control': 'no-store' })
+      const headers = { 'content-type': 'text/html; charset=utf-8', 'content-security-policy': shellCSP,
+        'x-content-type-options': 'nosniff', 'referrer-policy': 'same-origin', 'cache-control': 'no-store' }
+      setOriginCookie(req, core, headers, desktopPort)
+      res.writeHead(200, headers)
       return res.end(page)
     }
     if (route === '/favicon.png' && req.method === 'GET') {
@@ -200,22 +246,36 @@ export function createServer(core, { desktopPort = FNOS_DESKTOP_PORT } = {}) {
     }
     if (route === '/api/status' && req.method === 'GET') return json(res, 200, core.status())
     if (route === '/api/log' && req.method === 'GET') return json(res, 200, { log: core.tail() })
+    if (route === '/api/snapshots' && req.method === 'GET') return json(res, 200, { snapshots: core.snapshots() })
     if (route === '/api/action' && req.method === 'POST') {
       if (req.headers['x-fn-openclaw-action'] !== '1') return json(res, 403, { error: '操作请求无效。' })
       const action = url.searchParams.get('action')
+      if (action === 'cancel-update') { core.cancelUpdate = true; return json(res, 200, {}) }
+      if (action === 'update') {
+        const version = url.searchParams.get('version')
+        if (!validVersion(version)) return json(res, 400, { error: '版本格式无效。' })
+        if (acceptAction(core, res, action, version, { force: url.searchParams.get('force') === '1' })) return json(res, 202, {})
+        return
+      }
+      if (action === 'rollback') {
+        const restore = core.snapshots().find(item => item.name === url.searchParams.get('snapshot') && item.rollbackAvailable)
+        if (!restore) return json(res, 400, { error: '没有可校验的回退快照。' })
+        if (acceptAction(core, res, 'update', restore.version, { restore })) return json(res, 202, {})
+        return
+      }
       if (!['start', 'stop', 'restart'].includes(action)) return json(res, 400, { error: '未知操作。' })
       if (acceptAction(core, res, action)) return json(res, 202, {})
       return
     }
     if (route === '/open' && req.method === 'GET') {
-      if (core.phase !== 'running') return json(res, 503, { error: 'OpenClaw 尚未启动。' })
+      if (core.phase !== 'running' || core.available === false) return json(res, 503, { error: 'OpenClaw 正在维护或尚未启动。' })
       const headers = { location: UI_PATH + '/#token=' + core.token, 'referrer-policy': 'same-origin', 'cache-control': 'no-store' }
       setOriginCookie(req, core, headers, desktopPort)
       res.writeHead(303, headers)
       return res.end()
     }
     if (url.pathname === UI_PATH || url.pathname.startsWith(UI_PATH + '/')) {
-      if (core.phase !== 'running') return json(res, 503, { error: 'OpenClaw 尚未启动。' })
+      if (core.phase !== 'running' || core.available === false) return json(res, 503, { error: 'OpenClaw 正在维护或尚未启动。' })
       return proxyHTTP(req, res, url, core, desktopPort)
     }
     return json(res, 404, { error: '路径不存在。' })
@@ -223,7 +283,8 @@ export function createServer(core, { desktopPort = FNOS_DESKTOP_PORT } = {}) {
   server.on('upgrade', (req, socket, head) => {
     const url = requestURL(req)
     if (![UI_PATH, UI_PATH + '/'].includes(url?.pathname) ||
-        !isAdmin(req) || !websocketOrigin(req, core, desktopPort) || core.phase !== 'running') {
+        !isAdmin(req) || !websocketOrigin(req, core, desktopPort) || core.phase !== 'running' || core.available === false) {
+      rejected(req)
       return socket.end('HTTP/1.1 403 Forbidden\r\nConnection: close\r\n\r\n')
     }
     const headers = backendHeaders(req, core.port)
@@ -266,6 +327,15 @@ if (process.argv[1] && import.meta.url === pathToFileURL(path.resolve(process.ar
   // Local CLI uses the package-owned socket; version changes are not browser actions.
   const admin = http.createServer(async (req, res) => {
     if (req.method === 'GET' && req.url === '/status') return json(res, 200, core.status())
+    if (req.method === 'GET' && req.url === '/snapshots') return json(res, 200, { snapshots: core.snapshots() })
+    if (req.method === 'POST' && req.url === '/cancel-update') { core.cancelUpdate = true; return json(res, 200, {}) }
+    const localURL = requestURL(req)
+    if (req.method === 'POST' && localURL?.pathname.startsWith('/rollback/')) {
+      const restore = core.snapshots().find(item => item.name === localURL.pathname.slice('/rollback/'.length) && item.rollbackAvailable)
+      if (!restore) return json(res, 400, { error: '没有可校验的回退快照。' })
+      if (acceptAction(core, res, 'update', restore.version, { restore })) return json(res, 202, {})
+      return
+    }
     const action = req.url?.slice(1)
     if (req.method === 'POST' && ['start', 'stop', 'restart'].includes(action)) {
       if (!acceptAction(core, res, action)) return
@@ -274,9 +344,9 @@ if (process.argv[1] && import.meta.url === pathToFileURL(path.resolve(process.ar
       const status = core.status()
       return json(res, status.phase === 'stopped' ? 200 : 500, status)
     }
-    const version = req.url?.slice('/update/'.length)
-    if (req.method !== 'POST' || !req.url?.startsWith('/update/') || !validVersion(version)) return json(res, 400, { error: '版本格式无效。' })
-    if (acceptAction(core, res, 'update', version)) return json(res, 202, {})
+    const version = localURL?.pathname.slice('/update/'.length)
+    if (req.method !== 'POST' || !localURL?.pathname.startsWith('/update/') || !validVersion(version)) return json(res, 400, { error: '版本格式无效。' })
+    if (acceptAction(core, res, 'update', version, { force: localURL.searchParams.get('force') === '1' })) return json(res, 202, {})
   })
   admin.listen(adminSocket)
   server.listen(socket, () => {

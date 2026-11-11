@@ -7,6 +7,7 @@ import { setTimeout as delay } from 'node:timers/promises'
 import { test } from 'node:test'
 import { Core } from '../openclaw-fnos/app/shell/core.mjs'
 import { CORE_VERSION, UI_PATH } from '../openclaw-fnos/app/shell/defaults.mjs'
+import { prepareUpgrade } from '../openclaw-fnos/app/shell/maintenance.mjs'
 
 async function listen(server, port = 0) {
   await new Promise((resolve, reject) => {
@@ -232,7 +233,7 @@ test('interrupted update defers rollback while the port is in use', async t => {
   fs.writeFileSync(path.join(data, snapshot, 'sample.txt'), 'original data')
   fs.mkdirSync(stateDir)
   fs.writeFileSync(sample, 'partially changed')
-  fs.writeFileSync(transactionFile, JSON.stringify({ target: '2099.1.1', snapshot }))
+  fs.writeFileSync(transactionFile, JSON.stringify({ target: '2099.1.1', previous: CORE_VERSION, snapshot }))
   const listener = http.createServer()
   await listen(listener, f.port)
   t.after(() => close(listener))
@@ -276,4 +277,169 @@ test('a cleanup error after commit leaves the new runtime active', async t => {
   assert.equal(resumed.phase, 'running', resumed.tail())
   assert.equal(resumed.version, candidate)
   assert.equal(fs.existsSync(resumed.transactionFile), false)
+})
+
+test('an unavailable maintenance handshake leaves the serving Gateway and state untouched', async t => {
+  const f = await fixture(t)
+  f.install(CORE_VERSION)
+  f.install('2099.1.1')
+  await action(f.core, 'boot')
+  const pid = f.core.gateway.pid
+  const sample = path.join(f.core.stateDir, 'sample.txt')
+  fs.writeFileSync(sample, 'unchanged')
+  t.mock.method(f.core, 'rpc', async () => { throw new Error('unsupported') })
+  await action(f.core, 'update', '2099.1.1')
+  assert.equal(f.core.gateway.pid, pid)
+  assert.equal(f.core.available, true)
+  assert.equal(f.core.status().maintenance.stage, 'deferred')
+  assert.equal(fs.readFileSync(sample, 'utf8'), 'unchanged')
+  assert.equal(fs.existsSync(f.core.transactionFile), false)
+})
+
+test('a ready label cannot interrupt active tasks without explicit force, and cancellation resumes admission', async t => {
+  const f = await fixture(t)
+  const calls = []
+  t.mock.method(f.core, 'rpc', async method => {
+    calls.push(method)
+    if (method === 'system.info') return { pid: 123, processInstanceId: 'test' }
+    if (method === 'gateway.suspend.status') f.core.cancelUpdate = true
+    return { status: 'ready', activeCount: 2, blockers: [], writeCustody: [], suspensionId: 'lease', expiresAtMs: Date.now() + 45000 }
+  })
+  assert.equal(await prepareUpgrade(f.core), false)
+  assert.ok(!calls.includes('gateway.suspend.handoff'))
+  assert.equal(calls.at(-1), 'gateway.suspend.resume')
+})
+
+test('even explicit force refuses unsettled writes and releases the maintenance window', async t => {
+  const f = await fixture(t)
+  const calls = []
+  t.mock.method(f.core, 'rpc', async method => {
+    calls.push(method)
+    if (method === 'system.info') return { pid: 123, processInstanceId: 'test' }
+    return { status: 'draining', activeCount: 2, blockers: [], writeCustody: [{ count: 1 }], suspensionId: 'lease', expiresAtMs: Date.now() + 45000 }
+  })
+  assert.equal(await prepareUpgrade(f.core, { force: true }), false)
+  assert.ok(!calls.includes('gateway.suspend.handoff'))
+  assert.equal(calls.at(-1), 'gateway.suspend.resume')
+})
+
+test('unreadable candidate sessions roll back before browser ingress opens', async t => {
+  const f = await fixture(t)
+  f.install(CORE_VERSION)
+  f.install('2099.1.1', 'broken-sessions')
+  await action(f.core, 'boot')
+  const sample = path.join(f.core.stateDir, 'sample.txt')
+  fs.writeFileSync(sample, 'original')
+  await action(f.core, 'update', '2099.1.1')
+  assert.equal(f.core.version, CORE_VERSION)
+  assert.equal(f.core.available, true)
+  assert.equal(f.core.status().maintenance.stage, 'rolled-back')
+  assert.equal(fs.readFileSync(sample, 'utf8'), 'original')
+})
+
+test('verified rollback preserves the current state and snapshot tampering is refused', async t => {
+  const f = await fixture(t)
+  f.install(CORE_VERSION)
+  f.install('2099.1.1')
+  await action(f.core, 'boot')
+  const sample = path.join(f.core.stateDir, 'sample.txt')
+  fs.writeFileSync(sample, 'before update')
+  await action(f.core, 'update', '2099.1.1')
+  const restore = f.core.snapshots()[0]
+  assert.equal(restore.verified, true)
+  assert.ok(restore.bytes > 0)
+  fs.writeFileSync(sample, 'new messages')
+  assert.equal(f.core.action('update', restore.version, { restore }), true)
+  await f.core.job
+  assert.equal(f.core.version, CORE_VERSION, f.core.tail())
+  assert.equal(fs.readFileSync(sample, 'utf8'), 'before update')
+  const back = f.core.snapshots().find(item => item.version === '2099.1.1')
+  assert.equal(fs.readFileSync(path.join(f.core.data, back.name, 'sample.txt'), 'utf8'), 'new messages')
+  fs.writeFileSync(path.join(f.core.data, back.name, 'sample.txt'), 'tampered')
+  const pid = f.core.gateway.pid
+  assert.equal(f.core.action('update', back.version, { restore: back }), true)
+  await f.core.job
+  assert.equal(f.core.gateway.pid, pid)
+  assert.equal(f.core.maintenance.stage, 'failed')
+})
+
+test('shell default changes preserve an installed core version without an active.json', async t => {
+  const f = await fixture(t)
+  const previous = '2026.11.2'
+  f.install(previous)
+  await f.core.startCore(previous)
+  fs.unlinkSync(f.core.activeFile)
+  const next = f.replaceWrapper()
+  assert.equal(next.version, previous)
+})
+
+test('legacy interrupted upgrades never mistake the candidate owner record for a commit', async t => {
+  const f = await fixture(t)
+  f.install('2026.11.2')
+  const snapshot = 'snapshot-abcdef0123456789'
+  fs.mkdirSync(path.join(f.core.data, snapshot))
+  fs.writeFileSync(path.join(f.core.data, snapshot, 'sample.txt'), 'legacy original')
+  fs.mkdirSync(f.core.stateDir)
+  fs.writeFileSync(path.join(f.core.stateDir, 'sample.txt'), 'uncommitted candidate')
+  fs.writeFileSync(f.core.ownerFile, JSON.stringify({ version: '2026.11.3', instance: 'a'.repeat(32) }))
+  fs.writeFileSync(f.core.transactionFile, JSON.stringify({ target: '2026.11.3', snapshot }))
+  const next = f.replaceWrapper()
+  assert.equal(next.version, '2026.11.2')
+  await action(next, 'boot')
+  assert.equal(next.phase, 'running', next.tail())
+  assert.equal(fs.readFileSync(path.join(next.stateDir, 'sample.txt'), 'utf8'), 'legacy original')
+})
+
+test('snapshot retention prunes only managed history and preserves legacy directories', async t => {
+  const f = await fixture(t)
+  const legacy = 'snapshot-aaaaaaaaaaaaaaaa'
+  fs.mkdirSync(path.join(f.core.data, legacy))
+  for (let i = 0; i < 5; i++) {
+    const name = 'snapshot-' + String(i).padStart(16, '0')
+    fs.mkdirSync(path.join(f.core.data, name))
+    await f.core.recordSnapshot(name, CORE_VERSION, { sha256: 'a'.repeat(64), bytes: 1, files: 1 })
+  }
+  const records = JSON.parse(fs.readFileSync(f.core.snapshotsFile, 'utf8'))
+  records.forEach((r, i) => { r.createdAt = i + 1 })
+  fs.writeFileSync(f.core.snapshotsFile, JSON.stringify(records))
+  fs.writeFileSync(f.core.activeFile, JSON.stringify({ version: CORE_VERSION, snapshot: records[0].name }))
+  f.core.pruneSnapshots()
+  assert.ok(fs.existsSync(path.join(f.core.data, legacy)))
+  assert.ok(fs.existsSync(path.join(f.core.data, records[0].name)), 'active rollback point')
+  assert.ok(!fs.existsSync(path.join(f.core.data, records[1].name)), 'unprotected old snapshot')
+  assert.equal(f.core.snapshots().length, 5)
+})
+
+test('an expired maintenance lease resumes without attempting a stop', async t => {
+  const f = await fixture(t)
+  const calls = []
+  t.mock.method(f.core, 'rpc', async method => {
+    calls.push(method)
+    if (method === 'system.info') return { pid: 123, processInstanceId: 'test' }
+    if (method === 'gateway.suspend.status') return { status: 'running' }
+    return { suspensionId: 'lease', expiresAtMs: Date.now() + 45000 }
+  })
+  assert.equal(await prepareUpgrade(f.core), false)
+  assert.equal(calls.at(-1), 'gateway.suspend.resume')
+  assert.ok(!calls.includes('gateway.suspend.handoff'))
+})
+
+test('a lost handoff response is retried with the same lease and process identity', async t => {
+  const f = await fixture(t)
+  const expiresAtMs = Date.now() + 45000
+  const handoffs = []
+  t.mock.method(f.core, 'rpc', async (method, params) => {
+    if (method === 'system.info') return { pid: 123, processInstanceId: 'test' }
+    if (method === 'gateway.suspend.prepare') return { suspensionId: 'lease', expiresAtMs }
+    if (method === 'gateway.suspend.status') return { status: 'ready', writeCustody: [], expiresAtMs }
+    if (method === 'gateway.suspend.handoff') {
+      handoffs.push(params)
+      if (handoffs.length === 1) throw new Error('reply lost')
+      return { status: 'committed', suspensionId: 'lease', expiresAtMs }
+    }
+    assert.fail('committed handoff must not resume admission')
+  })
+  assert.equal(await prepareUpgrade(f.core), true)
+  assert.equal(handoffs.length, 2)
+  assert.deepEqual(handoffs[0], handoffs[1])
 })

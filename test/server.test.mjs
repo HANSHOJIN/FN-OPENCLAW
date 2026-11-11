@@ -120,3 +120,39 @@ test('the native relay can rewrite Host to loopback without losing its same-orig
   assert.equal((await request(UI_PATH + '/', { ...ws, cookie, 'sec-fetch-site': 'cross-site' })).statusCode, 403)
   assert.equal((await request(UI_PATH + '/', { ...ws, cookie, origin: 'https://' + relay + ':41001' })).statusCode, 403)
 })
+
+test('LAN HTTP WebViews without Fetch Metadata use a signed app-navigation proof', async t => {
+  const request = await fixture(t)
+  const origin = 'http://192.168.50.76:5666'
+  const ingress = { ...admin, host: '127.0.0.1', 'x-forwarded-proto': 'http' }
+  const module = { ...ingress, origin, referer: origin + UI_PATH + '/' }
+  assert.equal((await request(asset, module)).statusCode, 403)
+  const entry = await request(PREFIX + '/open', { ...ingress, referer: origin + PREFIX + '/' })
+  assert.equal(entry.statusCode, 303)
+  const cookie = entry.headers['set-cookie'][0].split(';')[0]
+  assert.ok(!entry.headers['set-cookie'][0].includes('; Secure'))
+  const allowed = { ...module, cookie }
+  assert.equal((await request(asset, allowed)).statusCode, 200)
+  assert.equal((await request(UI_PATH + '/', { ...ingress, origin, cookie, connection: 'Upgrade', upgrade: 'websocket' })).statusCode, 101)
+  for (const change of [
+    { cookie: '' }, { 'x-trim-userid': '1001' }, { 'x-trim-isadmin': 'false' },
+    { origin: 'http://192.168.50.77:5666' }, { origin: 'http://192.168.50.76:5667' },
+    { origin: 'http://public.test:5666' }, { host: 'other-device.test' },
+    { 'x-forwarded-proto': 'https' }, { 'sec-fetch-site': 'cross-site' },
+    { referer: origin + '/other-app/' },
+  ]) assert.equal((await request(asset, { ...allowed, ...change })).statusCode, 403, JSON.stringify(change))
+})
+
+test('native HTTPS navigation can bootstrap proof when the WebView omits Fetch Metadata', async t => {
+  const request = await fixture(t)
+  const origin = 'https://' + relay + ':41045'
+  const ingress = { ...admin, host: '127.0.0.1', 'x-forwarded-proto': 'https' }
+  const module = { ...ingress, origin, referer: origin + UI_PATH + '/assets/entry.js' }
+  assert.equal((await request(asset, module)).statusCode, 403)
+  const open = await request(PREFIX + '/open', { ...ingress, referer: origin + PREFIX + '/' })
+  const cookie = open.headers['set-cookie'][0].split(';')[0]
+  assert.equal((await request(asset, { ...module, cookie })).statusCode, 200)
+  assert.equal((await request(asset, { ...module, cookie, 'sec-fetch-site': 'cross-site' })).statusCode, 403)
+  const bad = await request(PREFIX + '/open', { ...ingress, referer: origin + '/another-app/' })
+  assert.equal(bad.headers['set-cookie'], undefined)
+})
