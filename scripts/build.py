@@ -4,6 +4,7 @@ import argparse
 import gzip
 import hashlib
 import io
+import json
 from pathlib import Path
 import re
 import shutil
@@ -82,7 +83,7 @@ def verify(output):
         checksums = re.findall(r'(?m)^checksum\s*=\s*([a-f0-9]{32})\s*$', manifest)
         if checksums != [hashlib.file_digest(archive.extractfile('app.tgz'), 'md5').hexdigest()]:
             raise ValueError('FPK checksum 与 app.tgz 不一致。')
-        for hook in ('main', 'upgrade_init', 'uninstall_init'):
+        for hook in ('main', 'upgrade_init', 'upgrade_callback', 'uninstall_init'):
             member = archive.getmember('cmd/' + hook)
             if member.mode != 0o755 or b'\r' in archive.extractfile(member).read():
                 raise ValueError('启动脚本权限或换行错误。')
@@ -92,8 +93,16 @@ def verify(output):
                 raise ValueError('框架版本信息与安装包 manifest 不一致。')
             if app.getmember('bin/fn-openclaw-core').mode != 0o755:
                 raise ValueError('核心更新命令缺少执行权限。')
+            policy = json.load(app.extractfile('framework-upgrade.json'))
+            defaults = app.extractfile('shell/defaults.mjs').read().decode('utf8')
+            core_version = re.search(r"CORE_VERSION = '([^']+)'", defaults).group(1)
+            if policy['framework'] != package_version or policy['target'] != core_version:
+                raise ValueError('框架适配目标与安装包或默认内核版本不一致。')
+            if policy.get('from') != ['2026.11.3']:
+                raise ValueError('尚未验证的内核迁移路径。')
             for file in ('ui/config', 'shell/server.mjs', 'shell/core.mjs', 'shell/versions.mjs', 'shell/maintenance.mjs', 'shell/index.html',
-                         'shell/shell.js', 'shell/shell.css', 'shell/titlebar.js', 'shell/titlebar.css'):
+                         'shell/shell.js', 'shell/shell.css', 'shell/titlebar.js', 'shell/titlebar.css',
+                         'shell/state-snapshot.mjs', 'shell/official-update.mjs'):
                 app.getmember(file)
             runtime = app.extractfile('node-runtime.tar.gz')
             if hashlib.file_digest(runtime, 'sha256').hexdigest() != NODE_SHA256:

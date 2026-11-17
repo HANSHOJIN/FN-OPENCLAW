@@ -2,17 +2,20 @@ import fs from 'node:fs'
 import path from 'node:path'
 import { createHash, randomUUID } from 'node:crypto'
 import { setTimeout as delay } from 'node:timers/promises'
+import { stateFilter } from './state-snapshot.mjs'
 
 export const snapshotName = value => /^snapshot-[a-f0-9]{16}$/.test(value)
 
 // Do not follow workspace symlinks: a state snapshot does not own external data.
-export async function inspectTree(root) {
+export async function inspectTree(root, { exclude = [] } = {}) {
   if (!(await fs.promises.lstat(root)).isDirectory()) throw new Error('快照目录无效。')
   const digest = createHash('sha256')
   let bytes = 0
   let files = 0
+  const include = stateFilter(root, exclude)
   async function visit(relative) {
     const absolute = path.join(root, relative)
+    if (!include(absolute)) return
     const stat = await fs.promises.lstat(absolute)
     if (stat.isSymbolicLink()) {
       digest.update(JSON.stringify(['link', relative, await fs.promises.readlink(absolute)]) + '\n')

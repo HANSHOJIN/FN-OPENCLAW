@@ -1,16 +1,49 @@
-.trim-ui__app-layout--header:has([data-fn-openclaw-titlebar][data-fn-openclaw-scheme="dark"]) {
-  color-scheme: dark;
-  background: #0e1015 !important;
-  color: #e5e7eb !important;
-}
-.trim-ui__app-layout--header:has([data-fn-openclaw-titlebar][data-fn-openclaw-scheme="light"]) {
+[data-fn-openclaw-window] {
+  --fn-openclaw-header: #faf9f7;
+  --fn-openclaw-body: #faf9f7;
+  --fn-openclaw-text: #25262b;
+  --fn-openclaw-border: #deddd9;
   color-scheme: light;
-  background: #faf9f7 !important;
-  color: #25262b !important;
+  background: var(--fn-openclaw-body) !important;
+  outline-color: var(--fn-openclaw-border) !important;
 }
-.trim-ui__app-layout--header:has([data-fn-openclaw-titlebar]) :is(.trim-ui__app-layout--header-title, [class*="app-layout-header-"]) {
+[data-fn-openclaw-window]:has([data-fn-openclaw-titlebar][data-fn-openclaw-scheme="dark"]) {
+  --fn-openclaw-header: #0e1015;
+  --fn-openclaw-body: #0e1015;
+  --fn-openclaw-text: #e5e7eb;
+  --fn-openclaw-border: #2a2d34;
+  color-scheme: dark;
+}
+[data-fn-openclaw-window] > [data-fn-openclaw-body] {
+  flex: 1 1 0% !important;
+  min-height: 0 !important;
+  height: auto !important;
+  overflow: hidden;
+  background: var(--fn-openclaw-body) !important;
+}
+[data-fn-openclaw-window] .trim-ui__app-layout--background {
+  background: var(--fn-openclaw-body) !important;
+}
+[data-fn-openclaw-window] iframe[data-fn-openclaw-frame] {
+  display: block;
+  width: 100%;
+  height: 100%;
+  border: 0;
+}
+[data-fn-openclaw-window] .trim-ui__app-layout--header {
+  box-sizing: border-box;
+  height: 32px !important;
+  min-height: 32px !important;
+  background: var(--fn-openclaw-header) !important;
+  color: var(--fn-openclaw-text) !important;
+  border-bottom: 1px solid var(--fn-openclaw-border);
+  /* fnOS applies opacity-50 to inactive headers, exposing the host backdrop. */
+  opacity: 1 !important;
+}
+[data-fn-openclaw-window] .trim-ui__app-layout--header :is(.trim-ui__app-layout--header-title, [class*="app-layout-header-"]) {
   color: inherit !important;
 }
+[data-fn-openclaw-window] .trim-ui__app-layout--header-title { font-size: 12px !important; }
 [data-fn-openclaw-titlebar] {
   position: relative;
   display: flex;
@@ -18,6 +51,7 @@
   min-width: 0;
   align-items: center;
   align-self: center;
+  height: 28px;
   margin-inline: auto 6px;
   color: inherit;
   font: 12px/1.2 system-ui, sans-serif;

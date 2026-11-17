@@ -5,7 +5,7 @@ import net from 'node:net'
 import { pathToFileURL } from 'node:url'
 import { createHash, createHmac, timingSafeEqual } from 'node:crypto'
 import { Core, validVersion } from './core.mjs'
-import { PREFIX, UI_PATH, FNOS_DESKTOP_PORT } from './defaults.mjs'
+import { PREFIX, UI_PATH, CORE_PORT, FNOS_DESKTOP_PORT } from './defaults.mjs'
 
 const files = new Map([
   ['/shell.css', ['shell.css', 'text/css']],
@@ -320,7 +320,11 @@ if (process.argv[1] && import.meta.url === pathToFileURL(path.resolve(process.ar
   const { TRIM_APPDEST: app, TRIM_PKGVAR: data, TRIM_PKGETC: config, TRIM_PKGHOME: home } = process.env
   process.umask(0o077)
   const ca = '/etc/ssl/certs/ca-certificates.crt'
-  const core = new Core({ data, config, home, npm: process.env.FN_OPENCLAW_NPM, ca: fs.existsSync(ca) && ca })
+  // A separate internal port lets isolated diagnostics use the shipped
+  // lifecycle without binding the production Gateway's listener.
+  const port = Number(process.env.FN_OPENCLAW_CORE_PORT ?? CORE_PORT)
+  if (!Number.isInteger(port) || port < 1024 || port > 65535) throw new Error('内部 Gateway 端口无效。')
+  const core = new Core({ data, config, home, port, npm: process.env.FN_OPENCLAW_NPM, ca: fs.existsSync(ca) && ca })
   const server = createServer(core)
   const socket = path.join(app, 'app.sock')
   const adminSocket = path.join(data, 'run', 'core-control.sock')

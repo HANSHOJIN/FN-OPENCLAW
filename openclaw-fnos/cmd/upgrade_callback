@@ -1,2 +1,10 @@
 #!/bin/bash
-exit 0
+set -euo pipefail
+umask 077
+: "${TRIM_APPDEST:?}" "${TRIM_PKGVAR:?}"
+# Only installing this FPK queues the reviewed adaptation. Ordinary restarts
+# and the public online-update endpoint cannot create this request.
+request="$TRIM_PKGVAR/framework-update.json"
+cp -- "$TRIM_APPDEST/framework-upgrade.json" "$request.next"
+chmod 600 "$request.next"
+mv -f -- "$request.next" "$request"

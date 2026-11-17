@@ -7,8 +7,9 @@ import { setTimeout as delay } from 'node:timers/promises'
 import { test } from 'node:test'
 import { Core } from '../openclaw-fnos/app/shell/core.mjs'
 import { CORE_VERSION, UI_PATH } from '../openclaw-fnos/app/shell/defaults.mjs'
-import { prepareUpgrade, auditUpgrade } from '../openclaw-fnos/app/shell/maintenance.mjs'
+import { prepareUpgrade, auditUpgrade, inspectTree } from '../openclaw-fnos/app/shell/maintenance.mjs'
 import { UpstreamVersions } from '../openclaw-fnos/app/shell/versions.mjs'
+import { MIGRATION_MESSAGE, FRAMEWORK_MESSAGE } from '../openclaw-fnos/app/shell/official-update.mjs'
 
 async function listen(server, port = 0) {
   await new Promise((resolve, reject) => {
@@ -22,13 +23,16 @@ async function close(server) {
   await new Promise(resolve => server.close(resolve))
 }
 
-async function fixture(t) {
+async function fixture(t, { officialUpdates = false } = {}) {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'fn-openclaw-test-'))
   const probe = http.createServer()
   const port = await listen(probe)
   await close(probe)
   const options = { data: path.join(root, 'data'), config: path.join(root, 'etc'), home: path.join(root, 'home'), port }
   const core = new Core(options)
+  // Existing lifecycle/fault tests explicitly exercise the retained state-switch
+  // engine. Public official-update admission has separate tests below.
+  if (!officialUpdates) t.mock.method(core, 'update', core.switchRuntime.bind(core))
   const wrappers = [core]
   t.after(async () => {
     for (const wrapper of wrappers.reverse()) {
@@ -40,6 +44,7 @@ async function fixture(t) {
     core, port,
     replaceWrapper() {
       const next = new Core(options)
+      if (!officialUpdates) t.mock.method(next, 'update', next.switchRuntime.bind(next))
       wrappers.push(next)
       return next
     },
@@ -620,4 +625,251 @@ test('offline rollback does not replace state or stop an unrelated listener', as
   assert.equal(stranger.listening, true)
   assert.equal(fs.readFileSync(sample, 'utf8'), 'current state must survive')
   assert.equal(fs.existsSync(path.join(f.core.data, restore.name)), true)
+})
+
+function writeState(core, relative, content) {
+  const file = path.join(core.stateDir, relative)
+  fs.mkdirSync(path.dirname(file), { recursive: true })
+  fs.writeFileSync(file, content)
+  return file
+}
+
+test('application-owned private roots reject group writes without changing project permissions', {
+  skip: process.platform !== 'linux',
+}, async t => {
+  const f = await fixture(t)
+  const project = writeState(f.core, 'workspace/project.txt', 'user file')
+  fs.chmodSync(project, 0o660)
+  for (const dir of [f.core.data, f.core.env.HOME]) fs.chmodSync(dir, 0o770)
+  f.replaceWrapper()
+  assert.equal(fs.statSync(f.core.data).mode & 0o777, 0o750)
+  assert.equal(fs.statSync(f.core.env.HOME).mode & 0o777, 0o750)
+  assert.equal(fs.statSync(project).mode & 0o777, 0o660)
+})
+
+for (const legacy of [false, true]) {
+  test('upgrades and ' + (legacy ? 'legacy full' : 'lean') + ' snapshot rollback keep current user files without copying them', async t => {
+    const f = await fixture(t)
+    f.install(CORE_VERSION);f.install('2099.1.1')
+    await action(f.core, 'boot')
+    const project = writeState(f.core, 'workspace/project.txt', 'original project')
+    const archive = writeState(f.core, 'agents/main/session-sqlite-import-archive/archive.jsonl', 'original archive')
+    const database = writeState(f.core, 'agents/main/agent/openclaw-agent.sqlite', 'original database')
+    const inodes = [fs.statSync(project).ino, fs.statSync(archive).ino]
+    await action(f.core, 'update', '2099.1.1')
+    assert.equal(f.core.version, '2099.1.1', f.core.tail())
+    let restore = f.core.snapshots()[0]
+    assert.equal(restore.scope, 'runtime-state')
+    assert.equal(fs.existsSync(path.join(f.core.data, restore.name, 'workspace')), false)
+    assert.equal(fs.existsSync(path.join(f.core.data, restore.name, 'agents/main/session-sqlite-import-archive')), false)
+    if (legacy) {
+      const name = 'snapshot-fedcba9876543210'
+      const directory = path.join(f.core.data, name)
+      await fs.promises.cp(f.core.stateDir, directory, { recursive: true })
+      await f.core.recordSnapshot(name, CORE_VERSION, await inspectTree(directory))
+      restore = f.core.snapshots().find(item => item.name === name)
+    }
+    fs.writeFileSync(project, 'latest project edits')
+    fs.writeFileSync(archive, 'latest archive content')
+    fs.writeFileSync(database, 'migrated database')
+    assert.equal(f.core.action('rollback', restore.version, { restore }), true)
+    await f.core.job
+    assert.equal(f.core.version, CORE_VERSION, f.core.tail())
+    assert.equal(fs.readFileSync(database, 'utf8'), 'original database')
+    assert.equal(fs.readFileSync(project, 'utf8'), 'latest project edits')
+    assert.equal(fs.readFileSync(archive, 'utf8'), 'latest archive content')
+    assert.deepEqual([fs.statSync(project).ino, fs.statSync(archive).ino], inodes)
+  })
+}
+
+test('a failed candidate restores the database and preserves newly edited and newly created workspaces', async t => {
+  const f = await fixture(t)
+  f.install(CORE_VERSION);f.install('2099.1.1', 'fail')
+  await action(f.core, 'boot')
+  const project = writeState(f.core, 'workspace/project.txt', 'original project')
+  const database = writeState(f.core, 'state/openclaw.sqlite', 'original database')
+  const inode = fs.statSync(project).ino
+  const start = f.core.startCore.bind(f.core)
+  t.mock.method(f.core, 'startCore', async (version, ...args) => {
+    if (version === '2099.1.1') {
+      fs.writeFileSync(project, 'edits must survive failed startup')
+      fs.writeFileSync(database, 'candidate database schema')
+      writeState(f.core, 'workspace-new/new.txt', 'new user file')
+    }
+    return start(version, ...args)
+  })
+  await action(f.core, 'update', '2099.1.1')
+  assert.equal(f.core.available, true, f.core.tail())
+  assert.equal(f.core.maintenance.stage, 'rolled-back')
+  assert.equal(fs.readFileSync(database, 'utf8'), 'original database')
+  assert.equal(fs.readFileSync(project, 'utf8'), 'edits must survive failed startup')
+  assert.equal(fs.statSync(project).ino, inode)
+  assert.equal(fs.readFileSync(path.join(f.core.stateDir, 'workspace-new/new.txt'), 'utf8'), 'new user file')
+})
+
+test('a failure after moving some preserved directories puts them all back without overwrites', async t => {
+  const f = await fixture(t)
+  f.install(CORE_VERSION);f.install('2099.1.1')
+  await action(f.core, 'boot')
+  const project = writeState(f.core, 'workspace/project.txt', 'keep project')
+  const cache = writeState(f.core, 'tmp/cache.txt', 'keep cache')
+  const inodes = [fs.statSync(project).ino, fs.statSync(cache).ino]
+  const rename = fs.renameSync
+  let injected = false
+  t.mock.method(fs, 'renameSync', (from, to) => {
+    if (!injected && to === path.join(f.core.stateDir, 'workspace')) {
+      injected = true;throw new Error('fixture: interrupted user data handoff')
+    }
+    return rename(from, to)
+  })
+  await action(f.core, 'update', '2099.1.1')
+  assert.equal(injected, true)
+  assert.equal(f.core.available, true, f.core.tail())
+  assert.equal(f.core.version, CORE_VERSION)
+  assert.equal(fs.readFileSync(project, 'utf8'), 'keep project')
+  assert.equal(fs.readFileSync(cache, 'utf8'), 'keep cache')
+  assert.deepEqual([fs.statSync(project).ino, fs.statSync(cache).ino], inodes)
+})
+
+for (const interruption of ['before copy', 'partial copy', 'partial user handoff', 'during recovery handoff', 'during recovery rename']) {
+  test('lean snapshot recovery survives an interruption ' + interruption, async t => {
+    const f = await fixture(t)
+    const project = writeState(f.core, 'workspace/project.txt', 'keep project')
+    writeState(f.core, 'tmp/cache.txt', 'keep temp')
+    writeState(f.core, 'state/openclaw.sqlite', 'original database')
+    const inode = fs.statSync(project).ino
+    const snapshot = 'snapshot-0123456789abcdef', backup = path.join(f.core.data, snapshot)
+    fs.writeFileSync(f.core.transactionFile, JSON.stringify({ format: 2, target: '2099.1.1', previous: CORE_VERSION,
+      snapshot, preserved: ['workspace', 'tmp'] }))
+    fs.renameSync(f.core.stateDir, backup)
+    if (interruption !== 'before copy') {
+      writeState(f.core, 'state/openclaw.sqlite', 'candidate database')
+      if (interruption !== 'partial copy') {
+        fs.renameSync(path.join(backup, 'workspace'), path.join(f.core.stateDir, 'workspace'))
+      }
+    }
+    if (interruption.startsWith('during recovery')) {
+      const rename = fs.renameSync
+      let injected = false
+      const error = t.mock.method(fs, 'renameSync', (from, to) => {
+        if (!injected && (interruption.endsWith('handoff') ? to === path.join(backup, 'workspace') : to === f.core.stateDir)) {
+          injected = true;throw new Error('fixture: machine stopped during recovery')
+        }
+        return rename(from, to)
+      })
+      assert.throws(() => f.core.recoverUpdate(), /machine stopped/)
+      error.mock.restore()
+      assert.equal(injected, true)
+      assert.match(JSON.parse(fs.readFileSync(f.core.transactionFile, 'utf8')).failed, /^failed-/)
+    }
+    const resumed = f.replaceWrapper()
+    resumed.recoverUpdate()
+    assert.equal(fs.readFileSync(project, 'utf8'), 'keep project')
+    assert.equal(fs.statSync(project).ino, inode)
+    assert.equal(fs.readFileSync(path.join(resumed.stateDir, 'tmp/cache.txt'), 'utf8'), 'keep temp')
+    assert.equal(fs.readFileSync(path.join(resumed.stateDir, 'state/openclaw.sqlite'), 'utf8'), 'original database')
+    assert.equal(fs.existsSync(resumed.transactionFile), false)
+  })
+}
+
+for (const report of [
+  { status: 'skipped', mode: 'unknown', reason: 'unmanaged-package-install' },
+  { status: 'error', mode: 'npm', reason: 'session-sqlite-migration-required' },
+]) {
+  test('public kernel update stops at official ' + report.reason + ' before downloading or stopping the Gateway', async t => {
+    const f = await fixture(t, { officialUpdates: true })
+    f.install(CORE_VERSION)
+    await action(f.core, 'boot')
+    const pid = f.core.gateway.pid
+    const project = writeState(f.core, 'workspace/project.txt', 'untouched user file')
+    const inode = fs.statSync(project).ino
+    let calls = 0, stops = 0
+    t.mock.method(f.core, 'cliJSON', async (version, args) => {
+      calls++
+      assert.equal(version, CORE_VERSION)
+      assert.deepEqual(args, ['update', '--tag', '2099.1.1', '--dry-run', '--json', '--timeout', '15'])
+      return report
+    })
+    for (const method of ['install', 'switchRuntime', 'rpc', 'recordSnapshot']) {
+      t.mock.method(f.core, method, () => assert.fail('official refusal must not call ' + method))
+    }
+    const stop = f.core.stopCore.bind(f.core)
+    t.mock.method(f.core, 'stopCore', (...args) => { stops++;return stop(...args) })
+    for (const force of [false, true]) {
+      assert.equal(f.core.action('update', '2099.1.1', { force }), true)
+      await f.core.job
+      assert.equal(f.core.gateway.pid, pid)
+      assert.equal(f.core.available, true)
+      assert.equal(f.core.version, CORE_VERSION)
+      assert.equal(stops, 0)
+      assert.equal(f.core.maintenance.stage, 'deferred')
+      assert.equal(f.core.maintenance.message, report.reason.includes('migration') ? MIGRATION_MESSAGE : FRAMEWORK_MESSAGE)
+      assert.equal(fs.existsSync(path.join(f.core.runtimes, '2099.1.1')), false)
+      assert.equal(fs.existsSync(f.core.transactionFile), false)
+      assert.equal(f.core.snapshots().length, 0)
+      assert.equal(fs.readFileSync(project, 'utf8'), 'untouched user file')
+      assert.equal(fs.statSync(project).ino, inode)
+    }
+    assert.equal(calls, 2)
+  })
+}
+
+test('official check failures preserve service and never become a fallback install or a migration claim', async t => {
+  const f = await fixture(t, { officialUpdates: true })
+  f.install(CORE_VERSION)
+  await action(f.core, 'boot')
+  const pid = f.core.gateway.pid
+  t.mock.method(f.core, 'cliJSON', async () => { throw new Error('fixture: registry timeout') })
+  t.mock.method(f.core, 'install', () => assert.fail('failed inspection cannot install anything'))
+  await action(f.core, 'update', '2099.1.1')
+  assert.equal(f.core.gateway.pid, pid)
+  assert.equal(f.core.available, true)
+  assert.equal(f.core.maintenance.stage, 'deferred')
+  assert.match(f.core.maintenance.message, /检查未完成/)
+  assert.doesNotMatch(f.core.maintenance.message, /需要迁移会话/)
+})
+
+const frameworkPolicy = JSON.parse(fs.readFileSync(new URL('../openclaw-fnos/app/framework-upgrade.json', import.meta.url), 'utf8'))
+
+for (const candidateFails of [false, true]) {
+  test('an installed FPK applies its reviewed core adaptation once and ' + (candidateFails ? 'retains the old version on failure' : 'does not undo a later manual rollback'), async t => {
+    const f = await fixture(t, { officialUpdates: true })
+    f.install('2026.11.3');f.install(CORE_VERSION, candidateFails ? 'fail' : 'serve')
+    f.core.version = '2026.11.3'
+    f.core.frameworkVersion = frameworkPolicy.framework
+    writeState(f.core, 'workspace/project.txt', 'keep user project')
+    fs.writeFileSync(f.core.frameworkRequestFile, JSON.stringify(frameworkPolicy))
+    t.mock.method(f.core, 'update', () => assert.fail('FPK adaptation is separate from unsupported online update'))
+    await action(f.core, 'boot')
+    assert.equal(f.core.available, true, f.core.tail())
+    assert.equal(f.core.version, candidateFails ? '2026.11.3' : CORE_VERSION)
+    assert.equal(fs.existsSync(f.core.frameworkRequestFile), false)
+    assert.equal(JSON.parse(fs.readFileSync(f.core.frameworkAttemptFile, 'utf8')).outcome, candidateFails ? 'not-applied' : 'complete')
+    if (!candidateFails) {
+      const restore = f.core.snapshots().find(item => item.version === '2026.11.3')
+      assert.equal(f.core.action('rollback', restore.version, { restore }), true)
+      await f.core.job
+      assert.equal(f.core.version, '2026.11.3')
+    }
+    await f.core.close()
+    const resumed = f.replaceWrapper()
+    resumed.frameworkVersion = frameworkPolicy.framework
+    await action(resumed, 'boot')
+    assert.equal(resumed.version, '2026.11.3', 'a consumed FPK request must never reapply on later boots')
+    assert.equal(fs.readFileSync(path.join(resumed.stateDir, 'workspace/project.txt'), 'utf8'), 'keep user project')
+  })
+}
+
+test('an FPK request cannot select an unreviewed source or a different target', async t => {
+  const f = await fixture(t, { officialUpdates: true })
+  f.install('2026.11.2');f.core.version = '2026.11.2';f.core.frameworkVersion = frameworkPolicy.framework
+  fs.writeFileSync(f.core.frameworkRequestFile, JSON.stringify(frameworkPolicy))
+  t.mock.method(f.core, 'switchRuntime', () => assert.fail('unreviewed sources cannot migrate'))
+  await action(f.core, 'boot')
+  assert.equal(f.core.available, true)
+  assert.equal(f.core.version, '2026.11.2')
+  assert.equal(JSON.parse(fs.readFileSync(f.core.frameworkAttemptFile, 'utf8')).outcome, 'unsupported-source')
+  fs.writeFileSync(f.core.frameworkRequestFile, JSON.stringify({ ...frameworkPolicy, target: '2099.1.1' }))
+  await f.core.applyFrameworkUpgrade()
+  assert.equal(f.core.version, '2026.11.2')
 })

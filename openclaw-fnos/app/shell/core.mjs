@@ -8,6 +8,8 @@ import { CORE_PORT, CORE_VERSION, UI_PATH } from './defaults.mjs'
 import { INSTANCE_ENV, findGatewayProcesses, isSameProcess, ownsGatewayListener } from './gateway-process.mjs'
 import { inspectTree, prepareUpgrade, auditUpgrade, snapshotName } from './maintenance.mjs'
 import { validVersion, frameworkVersion, compareVersions, UpstreamVersions } from './versions.mjs'
+import { preservedStatePaths, normalizePreserved, cloneRuntimeState, movePreservedState } from './state-snapshot.mjs'
+import { inspectOfficialUpdate } from './official-update.mjs'
 
 const RETRY_DELAYS = [2000, 5000, 15000, 30000]
 const STABLE_UPTIME = 60000
@@ -71,6 +73,8 @@ export class Core {
     this.pauseFile = path.join(data, 'gateway-stopped')
     this.updateStatusFile = path.join(data, 'update-status.json')
     this.snapshotsFile = path.join(data, 'snapshots.json')
+    this.frameworkRequestFile = path.join(data, 'framework-update.json')
+    this.frameworkAttemptFile = path.join(data, 'framework-update-attempt.json')
     this.paused = fs.existsSync(this.pauseFile)
     this.npm = npm
     this.phase = 'stopped'
@@ -79,7 +83,18 @@ export class Core {
     this.failure = ''
     this.frameworkVersion = frameworkVersion()
     this.upstream = new UpstreamVersions()
-    for (const dir of [data, config, home, this.runtimes]) fs.mkdirSync(dir, { recursive: true, mode: 0o700 })
+    for (const dir of [data, config, home, this.runtimes]) {
+      fs.mkdirSync(dir, { recursive: true, mode: 0o700 })
+      if (process.platform !== 'linux') continue
+      // fnOS creates application-owned roots as 0770. Newer cores reject
+      // writable temp ancestors. Tighten only these owned private roots;
+      // retain read/search bits and never recurse into workspace/share data.
+      const fd = fs.openSync(dir, fs.constants.O_RDONLY | fs.constants.O_DIRECTORY)
+      try {
+        const info = fs.fstatSync(fd)
+        if (info.uid === process.getuid() && (info.mode & 0o022)) fs.fchmodSync(fd, info.mode & 0o7755)
+      } finally { fs.closeSync(fd) }
+    }
     const tokenFile = path.join(config, 'gateway.token')
     if (!fs.existsSync(tokenFile)) fs.writeFileSync(tokenFile, randomBytes(32).toString('hex') + '\n', { flag: 'wx', mode: 0o600 })
     this.token = fs.readFileSync(tokenFile, 'utf8').trim()
@@ -133,9 +148,9 @@ export class Core {
     catch (error) { this.log('无法保存维护结果：' + error.message) }
   }
 
-  async cliJSON(version, args, { timeout = 15000, allowFailure = false } = {}) {
+  async cliJSON(version, args, { timeout = 15000, allowFailure = false, env = {} } = {}) {
     const child = spawn(process.execPath, [this.gatewayEntry(version), ...args], {
-      env: { ...this.env, OPENCLAW_SUPERVISOR_MODE: 'external' }, cwd: this.env.HOME,
+      env: { ...this.env, ...env, OPENCLAW_SUPERVISOR_MODE: 'external' }, cwd: env.HOME ?? this.env.HOME,
       detached: process.platform !== 'win32', windowsHide: true, stdio: ['ignore', 'pipe', 'pipe'],
     })
     this.inspector = child
@@ -225,7 +240,25 @@ export class Core {
     if (!/^snapshot-[0-9a-f]{16}$/.test(journal.snapshot)) throw new Error('升级恢复记录无效。')
     const snapshot = path.join(this.data, journal.snapshot)
     if (this.version !== journal.target && fs.existsSync(snapshot)) {
-      if (fs.existsSync(this.stateDir)) fs.renameSync(this.stateDir, path.join(this.data, 'failed-' + randomBytes(8).toString('hex')))
+      if (journal.format === 2) {
+        if (journal.failed && !/^failed-[0-9a-f]{16}$/.test(journal.failed)) throw new Error('升级恢复目录记录无效。')
+        const failed = path.join(this.data, journal.failed ?? 'failed-' + randomBytes(8).toString('hex'))
+        // Persist the staging location before renaming anything, so an app or
+        // machine restart can finish putting the same user files back.
+        journal.failed = path.basename(failed)
+        journal.preserved = normalizePreserved([
+          ...normalizePreserved(journal.preserved),
+          ...preservedStatePaths(snapshot), ...preservedStatePaths(this.stateDir), ...preservedStatePaths(failed),
+        ])
+        saveJSON(this.transactionFile, journal)
+        if (fs.existsSync(this.stateDir)) {
+          if (fs.existsSync(failed)) throw new Error('升级恢复目录冲突，已保留全部数据。')
+          fs.renameSync(this.stateDir, failed)
+        }
+        movePreservedState(failed, snapshot, journal.preserved)
+      } else if (fs.existsSync(this.stateDir)) {
+        fs.renameSync(this.stateDir, path.join(this.data, 'failed-' + randomBytes(8).toString('hex')))
+      }
       fs.renameSync(snapshot, this.stateDir)
       this.log('已恢复升级前的 OpenClaw 数据。')
     }
@@ -545,7 +578,76 @@ export class Core {
     this.phase = 'stopped'
   }
 
-  async update(target, { force = false, restore, allowOffline = false } = {}) {
+  async update(target, { force = false } = {}) {
+    if (!validVersion(target)) throw new Error('版本格式无效。')
+    if (target === this.version) throw new Error('已是指定版本。')
+    this.cancelUpdate = false
+    this.maintenance = undefined
+    this.updateProgress({ stage: 'downloading', target, force, blockIngress: false,
+      message: '正在通过官方 update 命令检查升级条件。' })
+    let check
+    try { check = await inspectOfficialUpdate(this, target) }
+    catch {
+      this.finishMaintenance({ stage: 'deferred', blockIngress: false,
+        message: '官方升级检查未完成，请稍后重试或等待 FN-OPENCLAW 框架安装包。' })
+      return
+    }
+    if (this.closing) return
+    if (this.cancelUpdate) {
+      this.finishMaintenance({ stage: 'deferred', blockIngress: false, message: '已取消更新，当前版本继续运行。' })
+      return
+    }
+    // The shipped per-version npm layout has no official mutable/global owner.
+    // Never fall back to installing another core and migrating user state here.
+    this.finishMaintenance({ stage: 'deferred', blockIngress: false, check, message: check.message })
+    this.log(check.message)
+  }
+
+  async applyFrameworkUpgrade() {
+    if (this.paused || this.phase !== 'running' || this.closing) return
+    let request, policy
+    try {
+      request = readJSON(this.frameworkRequestFile)
+      if (!request) return
+      policy = readJSON(new URL('../framework-upgrade.json', import.meta.url))
+      if (!policy || policy.framework !== this.frameworkVersion || policy.target !== CORE_VERSION ||
+          request.framework !== policy.framework || request.target !== policy.target || !Array.isArray(policy.from)) {
+        throw new Error('安装包的内核适配记录不匹配，当前版本继续运行。')
+      }
+      // Consume before doing work: interrupted or failed package handoffs must
+      // not repeatedly migrate state at every subsequent service restart.
+      fs.renameSync(this.frameworkRequestFile, this.frameworkAttemptFile)
+    } catch (error) {
+      this.log(error.message)
+      return
+    }
+    const previous = this.version
+    const record = outcome => {
+      try { saveJSON(this.frameworkAttemptFile, { framework: policy.framework, target: policy.target,
+        previous, current: this.version, outcome, updatedAt: Date.now() }) }
+      catch (error) { this.log('无法保存框架适配结果：' + error.message) }
+    }
+    if (this.version === policy.target) { record('already-current'); return }
+    if (!policy.from.includes(this.version)) {
+      this.finishMaintenance({ stage: 'deferred', target: policy.target, blockIngress: false,
+        message: '本安装包尚未验证当前内核的迁移路径，请等待对应的 FN-OPENCLAW 框架安装包。' })
+      record('unsupported-source')
+      return
+    }
+    this.log('正在应用框架安装包的 OpenClaw ' + policy.target + ' 适配。')
+    record('starting')
+    try {
+      await this.switchRuntime(policy.target)
+      record(this.version === policy.target && this.available ? 'complete' : 'not-applied')
+    } catch (error) {
+      record('failed')
+      throw error
+    }
+  }
+
+  // Retained for verified rollback and framework-controlled compatibility tests.
+  // The public kernel-update action cannot invoke this state-switching engine.
+  async switchRuntime(target, { force = false, restore, allowOffline = false } = {}) {
     if (!validVersion(target)) throw new Error('版本格式无效。')
     if (target === this.version) throw new Error('已是指定版本。')
     this.cancelUpdate = false
@@ -584,14 +686,20 @@ export class Core {
       const snapshot = 'snapshot-' + randomBytes(8).toString('hex')
       const backup = path.join(this.data, snapshot)
       fs.mkdirSync(this.stateDir, { recursive: true, mode: 0o700 })
-      saveJSON(this.transactionFile, { target, previous, snapshot })
-      fs.renameSync(this.stateDir, backup)
-      const verified = await inspectTree(backup)
       const source = restore ? path.join(this.data, restore.name) : backup
-      await fs.promises.cp(source, this.stateDir, { recursive: true, verbatimSymlinks: true })
+      const preserved = normalizePreserved([
+        ...preservedStatePaths(this.stateDir),
+        ...(restore ? preservedStatePaths(source) : []),
+      ])
+      saveJSON(this.transactionFile, { format: 2, target, previous, snapshot, preserved })
+      fs.renameSync(this.stateDir, backup)
+      const verified = await inspectTree(backup, { exclude: preserved })
+      const expected = restore ? await inspectTree(source, { exclude: preserved }) : verified
+      await cloneRuntimeState(source, this.stateDir, preserved)
       const copied = await inspectTree(this.stateDir)
-      if (copied.sha256 !== (restore?.sha256 ?? verified.sha256)) throw new Error('数据副本校验失败。')
-      await this.recordSnapshot(snapshot, previous, verified)
+      if (copied.sha256 !== expected.sha256) throw new Error('数据副本校验失败。')
+      movePreservedState(backup, this.stateDir, preserved)
+      await this.recordSnapshot(snapshot, previous, { ...verified, scope: 'runtime-state', preserved })
       this.updateProgress({ stage: 'starting', snapshot, bytes: verified.bytes, verified: true, message: '正在启动并验收目标版本。' })
       await this.startCore(target, entry, { verifyCore: true })
       if (this.phase !== 'running') throw new Error('候选版本未完成启动。')
@@ -646,10 +754,13 @@ export class Core {
       if (action === 'update') return this.update(version, options)
       if (action === 'rollback') {
         if (!options?.restore) throw new Error('请选择已校验的回滚快照。')
-        return this.update(version, { ...options, allowOffline: true })
+        return this.switchRuntime(version, { ...options, allowOffline: true })
       }
       const interrupted = fs.existsSync(this.transactionFile)
-      if (!interrupted && !['stop', 'restart'].includes(action) && await this.adoptGateway()) return
+      if (!interrupted && !['stop', 'restart'].includes(action) && await this.adoptGateway()) {
+        if (action === 'boot' || action === 'start') await this.applyFrameworkUpgrade()
+        return
+      }
       if (action === 'stop' || action === 'restart' || interrupted || this.gateway) await this.stopCore()
       if (action === 'stop') {
         this.phase = 'stopping'
@@ -664,6 +775,7 @@ export class Core {
           this.recoverUpdate()
         }
         await this.startCore()
+        if (action === 'boot' || action === 'start') await this.applyFrameworkUpgrade()
       }
     }).catch(async error => {
       let message = error.message

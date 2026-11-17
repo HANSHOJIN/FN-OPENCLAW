@@ -38,19 +38,26 @@ function createTitlebarDock(toolbar, slot) {
   function restore() {
     if (!mounted) return
     mounted.link.remove()
+    mounted.host.removeAttribute('data-fn-openclaw-window')
+    mounted.body.removeAttribute('data-fn-openclaw-body')
+    mounted.frame.removeAttribute('data-fn-openclaw-frame')
     mounted = undefined
     toolbar.removeAttribute('data-fn-openclaw-titlebar')
     slot.append(toolbar)
   }
 
   function sync() {
-    const host = window.frameElement?.closest(WINDOW)
+    const frame = window.frameElement
+    const host = frame?.closest(WINDOW)
     const header = host?.querySelector(HEADER)
     const minimize = header?.querySelector(MINIMIZE)
     if (!minimize || !header.isConnected) {
       restore()
       return
     }
+    let body = frame
+    while (body.parentElement && body.parentElement !== host) body = body.parentElement
+    if (body.parentElement !== host) { restore(); return }
     if (mounted?.header === header && mounted.minimize === minimize) {
       if (!mounted.ready || header.contains(toolbar)) return
     }
@@ -65,11 +72,14 @@ function createTitlebarDock(toolbar, slot) {
     const link = doc.createElement('link')
     link.rel = 'stylesheet'
     link.href = stylesheet
-    const dock = { header, minimize, link, ready: false }
+    const dock = { host, body, frame, header, minimize, link, ready: false }
     mounted = dock
     link.addEventListener('load', () => {
       if (mounted !== dock) return
       if (!controls.isConnected || !header.contains(controls)) return restore()
+      host.setAttribute('data-fn-openclaw-window', '')
+      body.setAttribute('data-fn-openclaw-body', '')
+      frame.setAttribute('data-fn-openclaw-frame', '')
       toolbar.setAttribute('data-fn-openclaw-titlebar', '')
       controls.before(toolbar)
       dock.ready = true
