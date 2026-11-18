@@ -137,7 +137,12 @@ export class Core {
   get available() { return this.phase === 'running' && !this.maintenance?.blockIngress }
 
   updateProgress(value) {
-    this.maintenance = { ...this.maintenance, ...value, updatedAt: Date.now() }
+    const now = Date.now()
+    this.maintenance = { startedAt: now, ...this.maintenance, ...value, updatedAt: now }
+    if (value.stage) {
+      if (['complete', 'deferred', 'failed', 'rolled-back'].includes(value.stage)) this.maintenance.finishedAt = now
+      else delete this.maintenance.finishedAt
+    }
     saveJSON(this.updateStatusFile, this.maintenance)
   }
 
@@ -427,7 +432,7 @@ export class Core {
       this.finishMaintenance({
         blockIngress: false,
         stage: this.maintenance.target === this.version ? 'complete' : 'rolled-back',
-        message: '当前版本已恢复就绪，入口已重新开放。',
+        message: '已恢复至 OpenClaw ' + this.version + '，当前服务正常。',
       })
     }
     this.log('OpenClaw 已就绪。')
@@ -583,7 +588,7 @@ export class Core {
     if (target === this.version) throw new Error('已是指定版本。')
     this.cancelUpdate = false
     this.maintenance = undefined
-    this.updateProgress({ stage: 'downloading', target, force, blockIngress: false,
+    this.updateProgress({ stage: 'checking', target, force, blockIngress: false,
       message: '正在通过官方 update 命令检查升级条件。' })
     let check
     try { check = await inspectOfficialUpdate(this, target) }
@@ -637,7 +642,7 @@ export class Core {
     this.log('正在应用框架安装包的 OpenClaw ' + policy.target + ' 适配。')
     record('starting')
     try {
-      await this.switchRuntime(policy.target)
+      await this.switchRuntime(policy.target, { doctorFix: policy.doctorFix === true })
       record(this.version === policy.target && this.available ? 'complete' : 'not-applied')
     } catch (error) {
       record('failed')
@@ -645,14 +650,70 @@ export class Core {
     }
   }
 
+  // Doctor can spend a long time archiving and migrating a large NAS profile.
+  // Only its exit status or an explicit cancellation may end this step.
+  async repairCore(version) {
+    if (!this.switchingUpdate || this.phase !== 'stopped' || this.gateway) {
+      throw new Error('Doctor 修复需要已停止的安装包维护窗口。')
+    }
+    if (this.cancelUpdate || this.closing) throw new Error('Doctor 数据库适配已取消。')
+    await this.assertPortFree()
+    this.updateProgress({ stage: 'doctor', doctorStartedAt: Date.now(), doctorStep: '启动官方 Doctor', message: '正在适配会话数据库。' })
+    this.log('正在使用 OpenClaw ' + version + ' 的 Doctor 适配已备份的运行数据。')
+    this.log('Doctor 不设总时长上限，进度见后续输出；取消升级或停用应用会中止适配并恢复旧版。')
+    const child = this.run([this.gatewayEntry(version), 'doctor', '--fix', '--non-interactive', '--yes'], {
+      ...this.env, OPENCLAW_SUPERVISOR_MODE: 'external',
+    })
+    this.inspector = child
+    const names = {
+      startup: '启动官方 Doctor', 'archive preparation': '准备修复前归档',
+      'maintenance begin': '取得数据库维护权限', 'Preserve original state': '保留修复前数据库',
+    }
+    const listeners = [child.stdout, child.stderr].map(stream => {
+      let pending = ''
+      const receive = chunk => {
+        pending += chunk
+        const lines = pending.split('\n');pending = lines.pop().slice(-1024)
+        for (const raw of lines) {
+          const line = raw.replace(/\x1b\[[0-9;]*m/g, '').trim()
+          const match = /^Doctor:\s+(.+)$/.exec(line)
+          // The upstream elapsed-time heartbeat is not a new maintenance step.
+          if (!match || /\(\d+s elapsed\)$/.test(match[1])) continue
+          const step = names[match[1]] || match[1].slice(0, 120)
+          if (this.maintenance?.stage === 'doctor' && this.maintenance.doctorStep !== step) {
+            this.finishMaintenance({ doctorStep: step })
+          }
+        }
+      }
+      stream.on('data', receive)
+      return () => stream.off('data', receive)
+    })
+    let cancelled = false
+    const timer = setInterval(() => {
+      if (!this.cancelUpdate || cancelled) return
+      cancelled = true
+      this.finishMaintenance({ stage: 'canceling', message: '正在停止官方 Doctor，随后恢复旧版。' })
+      void this.stopChild(child).catch(() => {})
+    }, 250)
+    try {
+      const result = await child.finished
+      if (cancelled || this.cancelUpdate || this.closing) throw new Error('Doctor 数据库适配已取消。')
+      if (result.code !== 0) throw new Error('Doctor 数据库适配失败，请查看运行日志。')
+    } finally {
+      clearInterval(timer)
+      listeners.forEach(dispose => dispose())
+      if (this.inspector === child) this.inspector = undefined
+    }
+  }
+
   // Retained for verified rollback and framework-controlled compatibility tests.
   // The public kernel-update action cannot invoke this state-switching engine.
-  async switchRuntime(target, { force = false, restore, allowOffline = false } = {}) {
+  async switchRuntime(target, { force = false, restore, allowOffline = false, doctorFix = false } = {}) {
     if (!validVersion(target)) throw new Error('版本格式无效。')
     if (target === this.version) throw new Error('已是指定版本。')
     this.cancelUpdate = false
     this.maintenance = undefined
-    this.updateProgress({ stage: 'downloading', target, force, message: '正在准备目标版本。', blockIngress: false })
+    this.updateProgress({ stage: 'downloading', target, previous: this.version, force, message: '正在准备目标版本。', blockIngress: false })
     // Install the candidate before taking the live state offline.
     let entry
     try {
@@ -664,7 +725,7 @@ export class Core {
       entry = await this.install(target)
     }
     catch (error) {
-      this.updateProgress({ stage: 'failed', message: error.message })
+      this.updateProgress({ stage: 'failed', message: error.message, reason: error.message })
       if (this.phase === 'running') { this.log(error.message); return }
       throw error
     }
@@ -700,9 +761,14 @@ export class Core {
       if (copied.sha256 !== expected.sha256) throw new Error('数据副本校验失败。')
       movePreservedState(backup, this.stateDir, preserved)
       await this.recordSnapshot(snapshot, previous, { ...verified, scope: 'runtime-state', preserved })
+      if (doctorFix && !restore) {
+        this.updateProgress({ snapshot, bytes: verified.bytes, verified: true })
+        await this.repairCore(target)
+      }
       this.updateProgress({ stage: 'starting', snapshot, bytes: verified.bytes, verified: true, message: '正在启动并验收目标版本。' })
       await this.startCore(target, entry, { verifyCore: true })
       if (this.phase !== 'running') throw new Error('候选版本未完成启动。')
+      this.updateProgress({ stage: 'verifying', message: '目标版本已启动，正在验收网关和会话库。' })
       const audit = await auditUpgrade(this, target)
       saveJSON(this.activeFile, { version: target, previous, snapshot })
       // After active.json commits, recovery must never restore the predecessor.
@@ -719,16 +785,20 @@ export class Core {
         throw error
       }
       this.log(error.message)
+      this.finishMaintenance({ stage: 'recovering', blockIngress: true, reason: error.message,
+        message: '正在恢复 OpenClaw ' + previous + '，等待服务重新就绪。' })
       try {
         await this.stopCore()
         await this.assertPortFree()
         this.recoverUpdate()
         if (!this.closing) await this.startCore(previous)
         if (this.phase === 'running' && !this.closing) {
-          this.finishMaintenance({ stage: 'rolled-back', blockIngress: false, message: '切换失败，已恢复旧版。' + error.message })
+          this.finishMaintenance({ stage: 'rolled-back', blockIngress: false, reason: error.message,
+            message: '已恢复至 OpenClaw ' + previous + '，当前服务正常。' })
         }
       } catch (recoveryError) {
-        this.finishMaintenance({ stage: 'failed', blockIngress: true, message: '切换失败，旧版尚未恢复就绪。' + recoveryError.message })
+        this.finishMaintenance({ stage: 'failed', blockIngress: true, reason: recoveryError.message,
+          message: '切换失败，OpenClaw ' + previous + ' 尚未恢复就绪。' })
         throw new Error(error.message + ' 恢复失败：' + recoveryError.message)
       }
       return

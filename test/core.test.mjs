@@ -831,34 +831,116 @@ test('official check failures preserve service and never become a fallback insta
 
 const frameworkPolicy = JSON.parse(fs.readFileSync(new URL('../openclaw-fnos/app/framework-upgrade.json', import.meta.url), 'utf8'))
 
-for (const candidateFails of [false, true]) {
-  test('an installed FPK applies its reviewed core adaptation once and ' + (candidateFails ? 'retains the old version on failure' : 'does not undo a later manual rollback'), async t => {
+for (const previous of frameworkPolicy.from) for (const candidateFails of [false, true]) {
+  test('an installed FPK upgrades ' + previous + ' once and ' + (candidateFails ? 'retains the old version on failure' : 'does not undo a later manual rollback'), async t => {
     const f = await fixture(t, { officialUpdates: true })
-    f.install('2026.11.3');f.install(CORE_VERSION, candidateFails ? 'fail' : 'serve')
-    f.core.version = '2026.11.3'
+    f.install(previous);f.install(CORE_VERSION, candidateFails ? 'fail' : 'serve')
+    f.core.version = previous
     f.core.frameworkVersion = frameworkPolicy.framework
     writeState(f.core, 'workspace/project.txt', 'keep user project')
     fs.writeFileSync(f.core.frameworkRequestFile, JSON.stringify(frameworkPolicy))
     t.mock.method(f.core, 'update', () => assert.fail('FPK adaptation is separate from unsupported online update'))
     await action(f.core, 'boot')
+    const doctor = JSON.parse(fs.readFileSync(path.join(path.dirname(f.core.gatewayEntry(CORE_VERSION)), 'doctor-called.json'), 'utf8'))
+    assert.deepEqual(doctor.args, ['doctor', '--fix', '--non-interactive', '--yes'])
+    assert.equal(doctor.state, f.core.stateDir)
+    assert.equal(doctor.config, f.core.env.OPENCLAW_CONFIG_PATH)
+    assert.equal(doctor.supervisor, 'external')
     assert.equal(f.core.available, true, f.core.tail())
-    assert.equal(f.core.version, candidateFails ? '2026.11.3' : CORE_VERSION)
+    assert.equal(f.core.version, candidateFails ? previous : CORE_VERSION)
     assert.equal(fs.existsSync(f.core.frameworkRequestFile), false)
     assert.equal(JSON.parse(fs.readFileSync(f.core.frameworkAttemptFile, 'utf8')).outcome, candidateFails ? 'not-applied' : 'complete')
     if (!candidateFails) {
-      const restore = f.core.snapshots().find(item => item.version === '2026.11.3')
+      const restore = f.core.snapshots().find(item => item.version === previous)
       assert.equal(f.core.action('rollback', restore.version, { restore }), true)
       await f.core.job
-      assert.equal(f.core.version, '2026.11.3')
+      assert.equal(f.core.version, previous)
     }
     await f.core.close()
     const resumed = f.replaceWrapper()
     resumed.frameworkVersion = frameworkPolicy.framework
     await action(resumed, 'boot')
-    assert.equal(resumed.version, '2026.11.3', 'a consumed FPK request must never reapply on later boots')
+    assert.equal(resumed.version, previous, 'a consumed FPK request must never reapply on later boots')
     assert.equal(fs.readFileSync(path.join(resumed.stateDir, 'workspace/project.txt'), 'utf8'), 'keep user project')
   })
 }
+
+for (const mode of ['doctor-fail', 'doctor-hang']) {
+  test('FPK Doctor ' + mode + ' restores the old database before reopening ingress', async t => {
+    const f = await fixture(t, { officialUpdates: true })
+    const previous = frameworkPolicy.from.at(-1)
+    f.install(previous);f.install(CORE_VERSION, mode)
+    f.core.version = previous
+    f.core.frameworkVersion = frameworkPolicy.framework
+    writeState(f.core, 'sample.txt', 'old database')
+    writeState(f.core, 'workspace/project.txt', 'latest user project')
+    fs.writeFileSync(f.core.frameworkRequestFile, JSON.stringify(frameworkPolicy))
+    const job = action(f.core, 'boot')
+    if (mode === 'doctor-hang') {
+      const called = path.join(path.dirname(f.core.gatewayEntry(CORE_VERSION)), 'doctor-called.json')
+      await until(f.core, () => fs.existsSync(called))
+      assert.ok(f.core.job, 'Doctor remains under maintenance until explicitly canceled')
+      f.core.cancelUpdate = true
+    }
+    await job
+    assert.equal(f.core.version, previous)
+    assert.equal(f.core.available, true, f.core.tail())
+    assert.equal(f.core.maintenance.stage, 'rolled-back')
+    assert.equal(f.core.maintenance.message, '已恢复至 OpenClaw ' + previous + '，当前服务正常。')
+    assert.match(f.core.maintenance.reason, /Doctor/)
+    assert.doesNotMatch(f.core.maintenance.message + f.core.maintenance.reason, /正在恢复/)
+    assert.equal(f.core.inspector, undefined)
+    assert.equal(fs.existsSync(f.core.transactionFile), false)
+    assert.equal(fs.readFileSync(path.join(f.core.stateDir, 'sample.txt'), 'utf8'), 'old database')
+    assert.equal(fs.readFileSync(path.join(f.core.stateDir, 'workspace/project.txt'), 'utf8'), 'latest user project')
+  })
+}
+
+test('Doctor reports its real substep without treating elapsed heartbeats as a new step', async t => {
+  const f = await fixture(t, { officialUpdates: true })
+  const previous = frameworkPolicy.from.at(-1)
+  f.install(previous);f.install(CORE_VERSION, 'doctor-progress')
+  f.core.version = previous;f.core.frameworkVersion = frameworkPolicy.framework
+  fs.writeFileSync(f.core.frameworkRequestFile, JSON.stringify(frameworkPolicy))
+  const job = action(f.core, 'boot')
+  await until(f.core, () => f.core.maintenance?.doctorStep === '保留修复前数据库')
+  assert.equal(f.core.maintenance.stage, 'doctor')
+  assert.ok(Number.isFinite(f.core.maintenance.doctorStartedAt))
+  assert.ok(Number.isFinite(f.core.maintenance.startedAt))
+  f.core.cancelUpdate = true
+  await job
+  assert.equal(f.core.maintenance.stage, 'rolled-back')
+  assert.ok(Number.isFinite(f.core.maintenance.finishedAt))
+  assert.equal(f.core.available, true)
+})
+
+test('stopping the app during Doctor restores state before the next ordinary boot', async t => {
+  const f = await fixture(t, { officialUpdates: true })
+  const previous = frameworkPolicy.from.at(-1)
+  f.install(previous);f.install(CORE_VERSION, 'doctor-hang')
+  f.core.version = previous;f.core.frameworkVersion = frameworkPolicy.framework
+  writeState(f.core, 'sample.txt', 'old database')
+  writeState(f.core, 'workspace/project.txt', 'user project')
+  fs.writeFileSync(f.core.frameworkRequestFile, JSON.stringify(frameworkPolicy))
+  assert.equal(f.core.action('boot'), true)
+  const called = path.join(path.dirname(f.core.gatewayEntry(CORE_VERSION)), 'doctor-called.json')
+  await until(f.core, () => fs.existsSync(called))
+  await f.core.close()
+  assert.equal(f.core.inspector, undefined)
+  assert.equal(fs.existsSync(f.core.transactionFile), false)
+  const resumed = f.replaceWrapper();resumed.frameworkVersion = frameworkPolicy.framework
+  await action(resumed, 'boot')
+  assert.equal(resumed.version, previous)
+  assert.equal(resumed.available, true, resumed.tail())
+  assert.equal(fs.readFileSync(path.join(resumed.stateDir, 'sample.txt'), 'utf8'), 'old database')
+  assert.equal(fs.readFileSync(path.join(resumed.stateDir, 'workspace/project.txt'), 'utf8'), 'user project')
+})
+
+test('Doctor repair refuses a missing stopped maintenance window', async t => {
+  const f = await fixture(t)
+  t.mock.method(f.core, 'run', () => assert.fail('Doctor must not run outside maintenance'))
+  await assert.rejects(f.core.repairCore(CORE_VERSION), /维护窗口/)
+})
 
 test('an FPK request cannot select an unreviewed source or a different target', async t => {
   const f = await fixture(t, { officialUpdates: true })

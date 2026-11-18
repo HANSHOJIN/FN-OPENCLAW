@@ -3,7 +3,7 @@ import fs from 'node:fs'
 import path from 'node:path'
 import net from 'node:net'
 import { pathToFileURL } from 'node:url'
-import { createHash, createHmac, timingSafeEqual } from 'node:crypto'
+import { createHash, createHmac, timingSafeEqual, randomBytes } from 'node:crypto'
 import { Core, validVersion } from './core.mjs'
 import { PREFIX, UI_PATH, CORE_PORT, FNOS_DESKTOP_PORT } from './defaults.mjs'
 
@@ -82,12 +82,58 @@ function originProof(req, core, origin) {
     .digest('hex')
 }
 
+function proofCookieName(origin) {
+  return originCookie + '_' + createHash('sha256').update(origin).digest('hex').slice(0, 16)
+}
+
+function cookies(req) {
+  return (req.headers.cookie || '').split(';').map(value => value.trim().split('=')).filter(parts => parts.length === 2)
+}
+
+function navigationTicket(req, core, now = Date.now()) {
+  const value = now + '.' + randomBytes(16).toString('hex')
+  const signature = createHmac('sha256', core.token).update(JSON.stringify([value, req.headers['x-trim-userid']])).digest('hex')
+  return value + '.' + signature
+}
+
+function validNavigationTicket(req, core) {
+  const value = req.headers['x-fn-openclaw-navigation']
+  if (typeof value !== 'string' || !/^\d{13}\.[a-f0-9]{32}\.[a-f0-9]{64}$/.test(value)) return false
+  const [issued, salt, signature] = value.split('.')
+  const age = Date.now() - Number(issued)
+  if (age < 0 || age > 300000) return false
+  const expected = createHmac('sha256', core.token).update(JSON.stringify([issued + '.' + salt, req.headers['x-trim-userid']])).digest('hex')
+  return timingSafeEqual(Buffer.from(signature), Buffer.from(expected))
+}
+
+function navigationOrigin(req, desktopPort) {
+  if (req.headers['sec-fetch-site'] && req.headers['sec-fetch-site'] !== 'same-origin') return
+  try {
+    const origin = new URL(req.headers.origin)
+    if (!['http:', 'https:'].includes(origin.protocol) || origin.origin !== req.headers.origin) return
+    if (sameOrigin(req, desktopPort, { allowRelayReferrer: false }) || isForwardedRelay(req, origin) || isForwardedLAN(req, origin, desktopPort)) return origin
+    const host = new URL('http://' + req.headers.host)
+    if (!host.port && isRelayOrigin(origin) && origin.hostname === host.hostname) return origin
+  } catch { /* Missing or opaque origins cannot bootstrap a connection. */ }
+}
+
+function issueOriginCookie(req, core, headers, origin) {
+  const name = proofCookieName(origin.origin)
+  const attributes = `; Path=${PREFIX}; HttpOnly; SameSite=Strict` + (origin.protocol === 'https:' ? '; Secure' : '')
+  const value = `${name}=${originProof(req, core, origin.origin)}${attributes}`
+  // Cookies share a hostname across ports. Keep independent proofs for a few
+  // concurrent FN Connect entrances, while bounding the cookie header size.
+  const old = [...new Set(cookies(req).map(([key]) => key).filter(key =>
+    /^fn_openclaw_origin_[a-f0-9]{16}$/.test(key) && key !== name))]
+  headers['set-cookie'] = [...(headers['set-cookie'] || []), value,
+    ...old.slice(0, Math.max(0, old.length - 5)).map(key => `${key}=${attributes}; Max-Age=0`)]
+}
+
 function hasOriginProof(req, core) {
   if (!req.headers.origin) return false
-  const proof = (req.headers.cookie || '').split(';').map(cookie => cookie.trim())
-    .find(cookie => cookie.startsWith(originCookie + '='))?.slice(originCookie.length + 1)
-  if (!proof || !/^[a-f\d]{64}$/.test(proof)) return false
-  return timingSafeEqual(Buffer.from(proof), Buffer.from(originProof(req, core, req.headers.origin)))
+  const name = proofCookieName(req.headers.origin)
+  return cookies(req).some(([key, proof]) => (key === name || key === originCookie) &&
+    /^[a-f\d]{64}$/.test(proof) && timingSafeEqual(Buffer.from(proof), Buffer.from(originProof(req, core, req.headers.origin))))
 }
 
 function httpOrigin(req, core, desktopPort) {
@@ -97,8 +143,8 @@ function httpOrigin(req, core, desktopPort) {
     const origin = new URL(req.headers.origin)
     // HTTP WebViews can omit Fetch Metadata. A previously authenticated app
     // navigation must have issued this origin-bound cookie before any fallback.
-    return (isForwardedRelay(req, origin) || isForwardedLAN(req, origin, desktopPort)) &&
-      sameAppReferrer(req, origin) && hasOriginProof(req, core)
+    return Boolean(navigationOrigin(req, desktopPort)) &&
+      (!req.headers.referer || sameAppReferrer(req, origin)) && hasOriginProof(req, core)
   } catch { return false }
 }
 
@@ -110,10 +156,7 @@ function setOriginCookie(req, core, headers, desktopPort) {
     const forwardedNavigation = !req.headers.origin && req.method === 'GET' && (!site || site === 'same-origin') &&
       (isForwardedLAN(req, source, desktopPort) || isForwardedRelay(req, source)) && sameAppReferrer(req, source)
     if (!sameOrigin(headersForOrigin, desktopPort) && !forwardedNavigation && !httpOrigin(headersForOrigin, core, desktopPort)) return
-    const proof = originProof(req, core, source.origin)
-    const cookie = `${originCookie}=${proof}; Path=${PREFIX}; HttpOnly; SameSite=Strict` +
-      (source.protocol === 'https:' ? '; Secure' : '')
-    headers['set-cookie'] = [...(headers['set-cookie'] || []), cookie]
+    issueOriginCookie(req, core, headers, source)
   } catch { /* A later same-origin resource request can supply the origin. */ }
 }
 
@@ -205,12 +248,27 @@ export function createServer(core, { desktopPort = FNOS_DESKTOP_PORT } = {}) {
     core.log?.('入口来源校验拒绝请求：' + JSON.stringify({
       transport: ['http', 'https'].includes(req.headers['x-forwarded-proto']) ? req.headers['x-forwarded-proto'] : 'missing/other',
       fetchSite: ['same-origin', 'cross-site', 'same-site', 'none'].includes(req.headers['sec-fetch-site']) ? req.headers['sec-fetch-site'] : 'missing',
-      originPresent: Boolean(req.headers.origin), referrerPresent: Boolean(req.headers.referer), proofPresent: Boolean(req.headers.cookie?.includes(originCookie + '=')),
+      originPresent: Boolean(req.headers.origin), referrerPresent: Boolean(req.headers.referer),
+      proofPresent: cookies(req).some(([name]) => name === originCookie || /^fn_openclaw_origin_[a-f0-9]{16}$/.test(name)),
+      requestKind: req.headers.upgrade === 'websocket' ? 'websocket' : 'http', proofValid: hasOriginProof(req, core),
     }))
   }
   const server = http.createServer((req, res) => {
     const url = requestURL(req)
     if (!url || (url.pathname !== PREFIX && !url.pathname.startsWith(PREFIX + '/'))) return json(res, 404, { error: '路径不存在。' })
+    if (url.pathname === PREFIX + '/api/navigation-proof' && req.method === 'POST') {
+      // A fresh authenticated HTML navigation supplies the short-lived ticket.
+      // It lets a WebView prove its real Origin even without Referer/Fetch Metadata.
+      const origin = navigationOrigin(req, desktopPort)
+      if (!isAdmin(req) || !origin || !validNavigationTicket(req, core)) {
+        rejected(req)
+        return json(res, 403, { error: '连接凭据校验未通过，请从飞牛关闭并重新打开应用。' })
+      }
+      const headers = { 'content-type': 'application/json; charset=utf-8', 'cache-control': 'no-store' }
+      issueOriginCookie(req, core, headers, origin)
+      res.writeHead(200, headers)
+      return res.end('{"ready":true}')
+    }
     if (!isAdmin(req) || !httpOrigin(req, core, desktopPort)) {
       rejected(req)
       return json(res, 403, { error: '请通过飞牛管理员入口访问。' })
@@ -222,8 +280,9 @@ export function createServer(core, { desktopPort = FNOS_DESKTOP_PORT } = {}) {
     }
     if (route === '/' && req.method === 'GET') {
       const status = core.status()
-      const page = shellTemplate.replace(/__FN_OPENCLAW_(STATUS|LOG|SCRIPT)__/g, (_, key) => {
+      const page = shellTemplate.replace(/__FN_OPENCLAW_(STATUS|LOG|SCRIPT|NAVIGATION)__/g, (_, key) => {
         if (key === 'SCRIPT') return shellScript
+        if (key === 'NAVIGATION') return navigationTicket(req, core)
         if (key === 'STATUS') return escapeHTML(phases[status.phase] + ' · ' + status.version)
         return escapeHTML(core.tail() || '暂无运行日志。')
       })
@@ -298,6 +357,7 @@ export function createServer(core, { desktopPort = FNOS_DESKTOP_PORT } = {}) {
       hostname: '127.0.0.1', port: core.port, path: '/', method: 'GET', headers,
     })
     upstream.on('upgrade', (response, remote, rest) => {
+      if (isRelayOrigin(new URL(req.headers.origin))) core.log?.('FN Connect WebSocket 来源校验已通过，上游连接已建立。')
       socket.write('HTTP/1.1 101 Switching Protocols\r\n' +
         response.rawHeaders.reduce((lines, value, index) => lines + value + (index % 2 ? '\r\n' : ': '), '') + '\r\n')
       if (rest.length) socket.write(rest)

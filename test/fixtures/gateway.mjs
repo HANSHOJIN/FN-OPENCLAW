@@ -13,6 +13,24 @@ if (process.argv[3] === 'call') {
   process.exit(0)
 }
 if (process.argv[2] === 'doctor') {
+  if (process.argv.includes('--fix')) {
+    fs.writeFileSync(path.join(path.dirname(fileURLToPath(import.meta.url)), 'doctor-called.json'), JSON.stringify({
+      args: process.argv.slice(2), state, config: process.env.OPENCLAW_CONFIG_PATH,
+      supervisor: process.env.OPENCLAW_SUPERVISOR_MODE,
+    }))
+    if (mode === 'doctor-progress') {
+      process.stdout.write('Doctor: Preserve ori')
+      setTimeout(() => process.stdout.write('ginal state\nDoctor: maintenance begin (10s elapsed)\n'), 20)
+    }
+    if (mode === 'doctor-hang' || mode === 'doctor-progress') {
+      setInterval(() => {}, 1000)
+      await new Promise(() => {})
+    }
+    if (mode === 'doctor-fail') {
+      fs.writeFileSync(path.join(state, 'sample.txt'), 'partial doctor repair')
+      process.exit(42)
+    }
+  }
   console.log(JSON.stringify({ findings: [] }))
   process.exit(0)
 }

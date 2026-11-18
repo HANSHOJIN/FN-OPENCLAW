@@ -27,6 +27,73 @@ let upstream
 let checkingUpstream = false
 let checkedUpstream = false
 let upstreamError = ''
+let navigationReady = false
+const maintenancePhases = {
+  checking: '检查升级条件', downloading: '下载安装内核', waiting: '等待活动任务结束',
+  snapshot: '创建回滚快照', doctor: '适配会话数据库', starting: '启动目标内核',
+  verifying: '验证网关与会话库', recovering: '恢复旧版中', canceling: '取消数据库适配',
+}
+
+function paint(element, text, tone = 'ok') {
+  if (element.textContent !== text) element.textContent = text
+  element.dataset.statusTone = tone
+}
+
+function maintenanceView() {
+  const update = status?.maintenance
+  if (!update) return { text: '尚未执行更新。', reason: '', elapsed: '', tone: 'ok' }
+  const current = status.version || '未知版本'
+  const target = update.target || '目标版本'
+  const active = status.busy && maintenancePhases[update.stage]
+  let text = update.message || '', reason = '', tone = 'ok'
+  if (active) {
+    const messages = {
+      checking: '正在通过官方命令检查升级条件。',
+      downloading: '正在下载并安装 OpenClaw ' + target + (status.available ? '，当前 ' + current + ' 继续运行。' : '。'),
+      waiting: '正在等待活动任务结束，尚未切换内核。' + (Number.isFinite(update.activeCount) ? ' 活动任务：' + update.activeCount + ' 项。' : ''),
+      snapshot: '正在创建并校验回滚快照，服务暂时停止。',
+      doctor: '正在适配会话数据库：' + (update.doctorStep || '启动官方 Doctor') + '。',
+      starting: '正在启动 OpenClaw ' + target + '，等待网关就绪。',
+      verifying: 'OpenClaw ' + target + ' 已启动，正在验证网关和会话库。',
+      recovering: '正在恢复 OpenClaw ' + (update.previous || current) + '，等待服务重新就绪。',
+      canceling: '正在停止官方 Doctor，随后恢复 OpenClaw ' + (update.previous || current) + '。',
+    }
+    text = messages[update.stage]
+  } else if (update.stage === 'rolled-back') {
+    text = status.available ? '已恢复至 OpenClaw ' + current + '，当前服务正常。' : '旧版数据已恢复，OpenClaw ' + current + ' 当前状态：' + (phases[status.phase] || '尚未就绪') + '。'
+    tone = status.failure || status.phase === 'failed' ? 'error' : 'ok'
+    const legacyReason = String(update.message || '').replace(/^切换失败，已恢复旧版。/, '').replace(/[，。\s]*正在恢复旧版[。\s]*$/, '')
+    reason = '本次升级未完成。' + (update.reason || (/失败|超时|取消/.test(legacyReason) ? legacyReason : ''))
+  } else if (update.stage === 'complete') {
+    text = status.available ? '版本切换已完成，当前运行 OpenClaw ' + current + '。' + (update.audit?.sessions ? ' 网关与会话库验收通过。' : '') :
+      '上次版本切换已完成，OpenClaw ' + current + ' 当前状态：' + (phases[status.phase] || '尚未就绪') + '。'
+    tone = status.failure || status.phase === 'failed' ? 'error' : 'ok'
+  } else if (update.stage === 'failed') {
+    text = status.available ? '升级未完成，当前 OpenClaw ' + current + ' 继续正常运行。' : '升级失败，OpenClaw ' + current + ' 尚未恢复就绪。'
+    tone = status.available ? 'ok' : 'error'
+    reason = '失败原因：' + (update.reason || update.message || status.failure || '请查看运行日志。')
+  } else if (update.stage === 'deferred') {
+    text = '本次升级未执行。' + (status.available ? ' 当前 OpenClaw ' + current + ' 正常运行。' : '') + ' ' + (update.message || '')
+  }
+  let elapsed = ''
+  const started = active && update.stage === 'doctor' ? update.doctorStartedAt || update.startedAt : update.startedAt
+  if (Number.isFinite(started)) {
+    const end = active ? Date.now() : update.finishedAt || update.updatedAt
+    if (Number.isFinite(end)) {
+      const seconds = Math.max(0, Math.floor((end - started) / 1000))
+      elapsed = (active ? (update.stage === 'doctor' ? '数据库适配已用时：' : '已用时：') : '本次用时：') +
+        (seconds >= 3600 ? Math.floor(seconds / 3600) + ' 小时 ' : '') + Math.floor(seconds / 60) % 60 + ' 分 ' + seconds % 60 + ' 秒'
+    }
+  }
+  return { text, reason, elapsed, tone }
+}
+
+function paintMaintenance(id, view) {
+  paint(byId(id + '-text'), view.text, view.tone)
+  paint(byId(id + '-reason'), view.reason, 'error')
+  // The timer is visible but outside the live region, avoiding an announcement every second.
+  paint(byId(id + '-elapsed'), view.elapsed)
+}
 
 function scrollLogToEnd() {
   log.scrollTop = log.scrollHeight
@@ -34,7 +101,10 @@ function scrollLogToEnd() {
 
 function statusText() {
   if (!status) return '正在连接…'
-  const parts = [phases[status.phase], status.version]
+  const update = status.maintenance
+  if (status.busy && maintenancePhases[update?.stage]) return maintenancePhases[update.stage] + ' · 目标 ' +
+    (['recovering', 'canceling'].includes(update.stage) ? update.previous || status.version : update.target)
+  const parts = [status.available ? '运行正常' : phases[status.phase], status.version]
   if (status.paused) parts.push('自动恢复已暂停')
   if (status.retryAt) parts.push(Math.max(0, Math.ceil((status.retryAt - Date.now()) / 1000)) + ' 秒后重试')
   if (status.retryExhausted) parts.push('已停止自动重试')
@@ -51,10 +121,11 @@ function render() {
   const running = status?.phase === 'running' && status.available !== false
   const locked = pending || !status || status.busy
   const update = status?.maintenance
-  statusLabel.textContent = connectionError || actionError || statusText()
+  const view = maintenanceView()
+  paint(statusLabel, connectionError || actionError || statusText(), connectionError || actionError || status?.failure || status?.phase === 'failed' ? 'error' : 'ok')
   toolbar.title = statusLabel.textContent
-  notice.hidden = !status?.failure && !(status?.busy && ['downloading', 'waiting', 'snapshot', 'starting'].includes(update?.stage))
-  notice.textContent = status?.failure ? statusText() : update?.message || ''
+  notice.hidden = !status?.failure && !(status?.busy && maintenancePhases[update?.stage])
+  paint(notice, status?.failure ? statusText() : view.text, status?.failure ? 'error' : view.tone)
   power.textContent = canStop() ? '停止' : '启动'
   power.disabled = locked
   restart.disabled = locked || !running
@@ -77,11 +148,12 @@ function render() {
   frame.hidden = !consolePanel.hidden
   logs.setAttribute('aria-pressed', String(!consolePanel.hidden))
   if (wasLogHidden && !consolePanel.hidden) scrollLogToEnd()
-  byId('update-status').textContent = update ? update.message + (Number.isFinite(update.activeCount) ? ' 活动任务：' + update.activeCount : '') : '尚未执行更新。'
+  paintMaintenance('update-status', view)
   const findings = update?.audit?.findings || []
   byId('audit-summary').textContent = update?.audit ? 'Gateway 与会话库读取通过。兼容性提示：' + findings.length + ' 项。\n' + findings.map(f => (f.severity === 'error' ? '错误：' : '提示：') + f.message).join('\n') : ''
   byId('apply-update').disabled = locked || !running
-  byId('cancel-update').disabled = !status?.busy || !['downloading', 'waiting'].includes(update?.stage)
+  byId('cancel-update').disabled = !status?.busy || pending || !['checking', 'downloading', 'waiting', 'doctor'].includes(update?.stage)
+  byId('cancel-update').textContent = update?.stage === 'doctor' ? '取消适配并恢复旧版' : '取消更新'
   byId('framework-version').textContent = status?.frameworkVersion && status.frameworkVersion !== 'unknown' ? status.frameworkVersion : '未知'
   byId('core-version').textContent = status?.version || '未知'
   const versions = status?.upstream || upstream
@@ -95,8 +167,8 @@ function render() {
   const result = checkingUpstream ? '正在检测上游正式版本…' : upstreamError ||
     (versions ? (versions.current !== status?.version ? '内核版本已变化，请重新检测。' : canUpdate ? '可更新到 ' + versions.latest : versions.comparison === -1 ? '当前内核高于上游正式版本。' : '当前已是最新内核。') +
       (Number.isFinite(versions.checkedAt) ? ' 检测时间：' + new Date(versions.checkedAt).toLocaleString() : '') : '尚未检测上游版本。')
-  byId('upstream-result').textContent = result
-  byId('console-maintenance').textContent = update?.message || ''
+  paint(byId('upstream-result'), result, upstreamError ? 'error' : 'ok')
+  paintMaintenance('console-maintenance', view)
   if (!consolePanel.hidden && status && !checkedUpstream) {
     checkedUpstream = true
     queueMicrotask(checkUpstream)
@@ -226,7 +298,9 @@ byId('updates').addEventListener('click', showMaintenance)
 byId('close-maintenance').addEventListener('click', () => maintenance.close())
 byId('apply-update').addEventListener('click', () => {
   const version = byId('target-version').value.trim()
-  if (!/^\d{4}\.\d{1,2}\.\d{1,3}(?:-\d{1,3})?$/.test(version)) { byId('update-status').textContent = '请填写有效版本号。'; return }
+  if (!/^\d{4}\.\d{1,2}\.\d{1,3}(?:-\d{1,3})?$/.test(version)) {
+    paintMaintenance('update-status', { text: '请填写有效版本号。', tone: 'error', reason: '', elapsed: '' });return
+  }
   const force = byId('force-update').checked
   if (force && !window.confirm('确定中断活动任务和终端，并切换版本？待保存数据仍须先完成写入。')) return
   action('update', { version, force: force ? '1' : '0' })
@@ -234,6 +308,19 @@ byId('apply-update').addEventListener('click', () => {
 byId('cancel-update').addEventListener('click', () => action('cancel-update'))
 
 async function poll() {
+  if (!navigationReady) {
+    try {
+      const ticket = document.querySelector('meta[name="fn-openclaw-navigation"]')?.content
+      if (!ticket) throw new Error('连接凭据缺失，请从飞牛关闭并重新打开应用。')
+      await api('navigation-proof', { method: 'POST', headers: { 'X-FN-OpenClaw-Navigation': ticket } })
+      navigationReady = true
+    } catch (error) {
+      connectionError = error.message
+      render()
+      setTimeout(poll, 3000)
+      return
+    }
+  }
   await refresh()
   setTimeout(poll, 1000)
 }

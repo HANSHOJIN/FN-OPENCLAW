@@ -3,6 +3,7 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="fn-openclaw-navigation" content="__FN_OPENCLAW_NAVIGATION__">
   <title>OpenClaw</title>
   <link rel="icon" href="./favicon.png">
   <link rel="stylesheet" href="./shell.css">
@@ -37,14 +38,14 @@
           <button id="console-rollback" disabled>回滚上次快照</button>
         </div>
         <p id="upstream-result" role="status"></p>
-        <p id="console-maintenance" role="status"></p>
+        <p id="console-maintenance"><span id="console-maintenance-text" role="status"></span><span id="console-maintenance-reason" role="status"></span><span id="console-maintenance-elapsed" aria-live="off"></span></p>
       </section>
     </section>
     <iframe id="control" title="OpenClaw Control UI" hidden></iframe>
   </main>
   <dialog id="maintenance">
     <header><h2>更新与快照</h2><button id="close-maintenance" aria-label="关闭">×</button></header>
-    <p id="update-status" role="status"></p>
+    <p id="update-status"><span id="update-status-text" role="status"></span><span id="update-status-reason" role="status"></span><span id="update-status-elapsed" aria-live="off"></span></p>
     <p id="audit-summary"></p>
     <label>目标 OpenClaw 版本 <input id="target-version" placeholder="2026.11.3" inputmode="decimal"></label>
     <p><label><input type="checkbox" id="force-update"> 允许中断仍在运行的任务和终端</label></p>

@@ -1,5 +1,6 @@
 import assert from 'node:assert/strict'
 import http from 'node:http'
+import { createHmac } from 'node:crypto'
 import { test } from 'node:test'
 import { createServer } from '../openclaw-fnos/app/shell/server.mjs'
 import { PREFIX, UI_PATH } from '../openclaw-fnos/app/shell/defaults.mjs'
@@ -22,7 +23,8 @@ async function fixture(t, overrides = {}) {
     socket.end('HTTP/1.1 101 Switching Protocols\r\nConnection: Upgrade\r\nUpgrade: websocket\r\n\r\n')
   })
   const port = await listen(t, upstream)
-  const shell = await listen(t, createServer({ port, token: 'test-token', phase: 'running', ...overrides }))
+  const shell = await listen(t, createServer({ port, token: 'test-token', phase: 'running',
+    status: () => ({ phase: 'running', version: '2026.11.4' }), tail: () => '', ...overrides }))
   return (path, headers, method = 'GET') => new Promise((resolve, reject) => {
     const req = http.request({ host: '127.0.0.1', port: shell, path, headers, method })
     req.on('response', res => {
@@ -45,6 +47,107 @@ async function fixture(t, overrides = {}) {
 const relay = 'device-test.app.5ddd.com'
 const admin = { 'x-trim-userid': '1000', 'x-trim-isadmin': 'true' }
 const asset = UI_PATH + '/assets/index.js'
+
+async function ticket(request, headers) {
+  const entry = await request(PREFIX + '/', headers)
+  assert.equal(entry.statusCode, 200)
+  assert.equal(entry.headers['cache-control'], 'no-store')
+  assert.match(entry.headers['content-security-policy'], /script-src 'sha256-/)
+  return entry.text.match(/name="fn-openclaw-navigation" content="([^"]+)"/)[1]
+}
+
+test('a fresh authenticated navigation repairs a stale proof without Referrer or Fetch Metadata', async t => {
+  const request = await fixture(t)
+  const ingress = { ...admin, host: '127.0.0.1', 'x-forwarded-proto': 'https' }
+  const oldOrigin = 'https://' + relay + ':41001'
+  const origin = 'https://' + relay + ':42163'
+  const old = await request(PREFIX + '/open', { ...ingress, referer: oldOrigin + PREFIX + '/' })
+  const oldCookie = old.headers['set-cookie'][0].split(';')[0]
+  const navigation = await ticket(request, { ...ingress, cookie: oldCookie })
+  const headers = { ...ingress, origin, cookie: oldCookie }
+  const ws = { ...headers, connection: 'Upgrade', upgrade: 'websocket' }
+  assert.equal((await request(UI_PATH + '/', ws)).statusCode, 403)
+  const proof = await request(PREFIX + '/api/navigation-proof', { ...headers, 'x-fn-openclaw-navigation': navigation }, 'POST')
+  assert.equal(proof.statusCode, 200)
+  assert.deepEqual(JSON.parse(proof.text), { ready: true })
+  assert.equal(proof.headers['access-control-allow-origin'], undefined)
+  assert.match(proof.headers['set-cookie'][0], /; HttpOnly; SameSite=Strict; Secure$/)
+  const cookie = proof.headers['set-cookie'][0].split(';')[0]
+  assert.notEqual(cookie.split('=')[0], oldCookie.split('=')[0])
+  const both = oldCookie + '; ' + cookie
+  assert.equal((await request(asset, { ...headers, cookie: both })).statusCode, 200)
+  assert.equal((await request(UI_PATH + '/', { ...ws, cookie: both })).statusCode, 101)
+  assert.equal((await request(UI_PATH + '/', { ...ws, origin: oldOrigin, cookie: both })).statusCode, 101)
+  assert.equal((await request(asset, { ...headers, cookie, referer: origin + '/other-app/' })).statusCode, 403)
+})
+
+test('navigation bootstrap supports LAN and port-stripped relay entrances', async t => {
+  const request = await fixture(t)
+  for (const [origin, host, proto] of [
+    ['http://192.168.50.76:5666', '127.0.0.1', 'http'],
+    ['https://' + relay + ':42163', relay, 'https'],
+    ['http://desktop.test:5666', 'desktop.test', 'http'],
+  ]) {
+    const ingress = { ...admin, host, 'x-forwarded-proto': proto }
+    const navigation = await ticket(request, ingress)
+    const proof = await request(PREFIX + '/api/navigation-proof', { ...ingress, origin, 'x-fn-openclaw-navigation': navigation }, 'POST')
+    assert.equal(proof.statusCode, 200, origin)
+    assert.equal(proof.headers['set-cookie'][0].includes('; Secure'), origin.startsWith('https:'))
+    const cookie = proof.headers['set-cookie'][0].split(';')[0]
+    assert.equal((await request(asset, { ...ingress, origin, cookie })).statusCode, 200, origin)
+    assert.equal((await request(UI_PATH + '/', { ...ingress, origin, cookie, connection: 'Upgrade', upgrade: 'websocket' })).statusCode, 101, origin)
+  }
+})
+
+test('bootstrap rejects forged, expired, cross-origin or non-admin requests', async t => {
+  const request = await fixture(t)
+  const ingress = { ...admin, host: '127.0.0.1', 'x-forwarded-proto': 'https' }
+  const navigation = await ticket(request, ingress)
+  const origin = 'https://' + relay + ':42163'
+  const valid = { ...ingress, origin, 'x-fn-openclaw-navigation': navigation }
+  const signed = (now, user = '1000') => {
+    const value = now + '.' + 'a'.repeat(32)
+    return value + '.' + createHmac('sha256', 'test-token').update(JSON.stringify([value, user])).digest('hex')
+  }
+  for (const change of [
+    { 'x-fn-openclaw-navigation': '' },
+    { 'x-fn-openclaw-navigation': navigation.slice(0, -1) + (navigation.endsWith('0') ? '1' : '0') },
+    { 'x-fn-openclaw-navigation': signed(Date.now() - 301000) },
+    { 'x-fn-openclaw-navigation': signed(Date.now() + 60000) },
+    { 'x-trim-userid': '1001' }, { 'x-trim-isadmin': 'false' },
+    { 'sec-fetch-site': 'cross-site' }, { 'sec-fetch-site': 'same-site' },
+    { origin: '' }, { origin: 'null' }, { origin: origin + '/' },
+    { origin: 'https://evil.test' }, { origin: 'http://' + relay + ':42163' },
+    { host: 'other-device.app.5ddd.com' }, { host: relay + ':41001' },
+    { 'x-forwarded-proto': 'http' },
+  ]) {
+    const response = await request(PREFIX + '/api/navigation-proof', { ...valid, ...change }, 'POST')
+    assert.equal(response.statusCode, 403, JSON.stringify(change))
+    assert.equal(response.headers['set-cookie'], undefined)
+    assert.doesNotMatch(response.text, /test-token|[a-f0-9]{64}/)
+  }
+})
+
+test('independent origin cookies are bounded without clearing other application cookies', async t => {
+  const request = await fixture(t)
+  const ingress = { ...admin, host: '127.0.0.1', 'x-forwarded-proto': 'https' }
+  const navigation = await ticket(request, ingress)
+  const jar = new Map([['nas-session', 'private']])
+  for (let port = 41000; port < 41009; port++) {
+    const response = await request(PREFIX + '/api/navigation-proof', { ...ingress,
+      origin: 'https://' + relay + ':' + port, 'x-fn-openclaw-navigation': navigation,
+      cookie: [...jar].map(([name, value]) => name + '=' + value).join('; '),
+    }, 'POST')
+    assert.equal(response.statusCode, 200)
+    for (const line of response.headers['set-cookie']) {
+      const [name, value] = line.split(';')[0].split('=')
+      if (line.includes('Max-Age=0')) jar.delete(name)
+      else jar.set(name, value)
+    }
+  }
+  assert.equal(jar.size, 7)
+  assert.equal(jar.get('nas-session'), 'private')
+})
 
 test('FN Connect assets accept changing relay ports with same-origin referrers', async t => {
   const request = await fixture(t)
