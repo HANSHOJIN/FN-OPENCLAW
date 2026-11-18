@@ -1,6 +1,8 @@
 # OpenClaw for fnOS
 
 <img src="openclaw-fnos/ICON.PNG" width="64" height="64" alt="OpenClaw 图标">
+11.18同步更新到11.5.这次需要转换数据库，升级过程大约需要20分钟，非常折磨。Openclaw不能再使用这样的升级逻辑了。
+
 原版飞牛框架久久不更新了，所以自制框架。首次启动会下载本版指定的 OpenClaw 核心。
 
 老版本数据迁移建议：让老版本制作迁移文件参考文档--发给新版本--由新版本完成迁移。
