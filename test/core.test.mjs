@@ -6,6 +6,7 @@ import path from 'node:path'
 import { setTimeout as delay } from 'node:timers/promises'
 import { test } from 'node:test'
 import { Core } from '../openclaw-fnos/app/shell/core.mjs'
+import { DatabaseSync } from 'node:sqlite'
 import { CORE_VERSION, UI_PATH } from '../openclaw-fnos/app/shell/defaults.mjs'
 import { prepareUpgrade, auditUpgrade, inspectTree } from '../openclaw-fnos/app/shell/maintenance.mjs'
 import { UpstreamVersions } from '../openclaw-fnos/app/shell/versions.mjs'
@@ -60,8 +61,8 @@ async function fixture(t, { officialUpdates = false } = {}) {
   }
 }
 
-async function action(core, name, version) {
-  assert.equal(core.action(name, version), true)
+async function action(core, name, version, options) {
+  assert.equal(core.action(name, version, options), true)
   await core.job
 }
 
@@ -772,10 +773,7 @@ for (const interruption of ['before copy', 'partial copy', 'partial user handoff
   })
 }
 
-for (const report of [
-  { status: 'skipped', mode: 'unknown', reason: 'unmanaged-package-install' },
-  { status: 'error', mode: 'npm', reason: 'session-sqlite-migration-required' },
-]) {
+for (const report of [{ status: 'error', mode: 'npm', reason: 'session-sqlite-migration-required' }]) {
   test('public kernel update stops at official ' + report.reason + ' before downloading or stopping the Gateway', async t => {
     const f = await fixture(t, { officialUpdates: true })
     f.install(CORE_VERSION)
@@ -784,6 +782,7 @@ for (const report of [
     const project = writeState(f.core, 'workspace/project.txt', 'untouched user file')
     const inode = fs.statSync(project).ino
     let calls = 0, stops = 0
+    t.mock.method(f.core, 'checkUpstream', async () => ({ latest: '2099.1.1' }))
     t.mock.method(f.core, 'cliJSON', async (version, args) => {
       calls++
       assert.equal(version, CORE_VERSION)
@@ -803,7 +802,7 @@ for (const report of [
       assert.equal(f.core.version, CORE_VERSION)
       assert.equal(stops, 0)
       assert.equal(f.core.maintenance.stage, 'deferred')
-      assert.equal(f.core.maintenance.message, report.reason.includes('migration') ? MIGRATION_MESSAGE : FRAMEWORK_MESSAGE)
+      assert.equal(f.core.maintenance.message, MIGRATION_MESSAGE)
       assert.equal(fs.existsSync(path.join(f.core.runtimes, '2099.1.1')), false)
       assert.equal(fs.existsSync(f.core.transactionFile), false)
       assert.equal(f.core.snapshots().length, 0)
@@ -819,6 +818,7 @@ test('official check failures preserve service and never become a fallback insta
   f.install(CORE_VERSION)
   await action(f.core, 'boot')
   const pid = f.core.gateway.pid
+  t.mock.method(f.core, 'checkUpstream', async () => ({ latest: '2099.1.1' }))
   t.mock.method(f.core, 'cliJSON', async () => { throw new Error('fixture: registry timeout') })
   t.mock.method(f.core, 'install', () => assert.fail('failed inspection cannot install anything'))
   await action(f.core, 'update', '2099.1.1')
@@ -829,6 +829,59 @@ test('official check failures preserve service and never become a fallback insta
   assert.doesNotMatch(f.core.maintenance.message, /需要迁移会话/)
 })
 
+test('online updates preflight actual WAL data, require one-time confirmation, and recheck after drain', async t => {
+  const f = await fixture(t, { officialUpdates: true })
+  const target = '2099.1.1'
+  f.install(CORE_VERSION); f.install(target)
+  await action(f.core, 'boot')
+  const pid = f.core.gateway.pid
+  const project = writeState(f.core, 'workspace/project.txt', 'latest project')
+  const shared = path.join(f.core.stateDir, 'state', 'openclaw.sqlite')
+  const agent = path.join(f.core.stateDir, 'agents', 'main', 'agent', 'openclaw-agent.sqlite')
+  for (const file of [shared, agent]) fs.mkdirSync(path.dirname(file), { recursive: true })
+  const sharedDB = new DatabaseSync(shared)
+  sharedDB.exec('PRAGMA journal_mode=WAL; CREATE TABLE agent_databases (agent_id TEXT, path TEXT);')
+  sharedDB.prepare('INSERT INTO agent_databases VALUES (?, ?)').run('main', 'agents/main/agent/openclaw-agent.sqlite')
+  const agentDB = new DatabaseSync(agent)
+  agentDB.exec("PRAGMA journal_mode=WAL; CREATE TABLE example (content TEXT); INSERT INTO example VALUES ('existing conversation')")
+  let copiedAgents = 0
+  const cli = f.core.cliJSON.bind(f.core)
+  t.mock.method(f.core, 'checkUpstream', async () => ({ latest: target }))
+  t.mock.method(f.core, 'cliJSON', async (version, args, opts) => {
+    if (args[0] === 'update') return { status: 'skipped', reason: 'unmanaged-package-install' }
+    if (args[2] === 'config.get') return { config: {} }
+    if (args[0] !== 'database') return cli(version, args, opts)
+    assert.equal(version, target)
+    const copy = args[2]
+    assert.ok(!fs.existsSync(copy + '-wal'))
+    if (args[1] === 'preflight') return { schema: 'openclaw.state-schema-preflight.v1', status: 'exact' }
+    const db = new DatabaseSync(copy, { readOnly: true })
+    try { assert.equal(db.prepare('SELECT content FROM example').get().content, 'existing conversation') }
+    finally { db.close() }
+    copiedAgents++
+    return { schema: 'openclaw.agent-schema-preflight.v1', status: 'exact', agentId: 'main' }
+  })
+  try {
+    assert.equal(f.core.action('activate', undefined, { approval: 'invalid' }), false)
+    await action(f.core, 'update')
+    assert.equal(f.core.maintenance.stage, 'awaiting-confirmation', f.core.tail())
+    assert.equal(f.core.gateway.pid, pid)
+    assert.equal(copiedAgents, 1)
+    assert.equal(f.core.snapshots().length, 0)
+  } finally {
+    agentDB.close()
+    sharedDB.close()
+  }
+  const { id } = f.core.status().preparedKernel
+  await action(f.core, 'activate', undefined, { approval: id })
+  assert.equal(f.core.maintenance.stage, 'complete', f.core.tail())
+  assert.equal(f.core.version, target)
+  assert.equal(copiedAgents, 2)
+  assert.equal(f.core.action('activate', undefined, { approval: id }), false)
+  assert.equal(fs.readFileSync(project, 'utf8'), 'latest project')
+  assert.ok(!fs.readdirSync(f.core.data).some(name => name.startsWith('kernel-check-')))
+})
+
 const frameworkPolicy = JSON.parse(fs.readFileSync(new URL('../openclaw-fnos/app/framework-upgrade.json', import.meta.url), 'utf8'))
 
 for (const previous of frameworkPolicy.from) for (const candidateFails of [false, true]) {
@@ -837,23 +890,44 @@ for (const previous of frameworkPolicy.from) for (const candidateFails of [false
     f.install(previous);f.install(CORE_VERSION, candidateFails ? 'fail' : 'serve')
     f.core.version = previous
     f.core.frameworkVersion = frameworkPolicy.framework
+    f.core.maintenance = { stage: 'deferred', message: FRAMEWORK_MESSAGE }
     writeState(f.core, 'workspace/project.txt', 'keep user project')
     fs.writeFileSync(f.core.frameworkRequestFile, JSON.stringify(frameworkPolicy))
     t.mock.method(f.core, 'update', () => assert.fail('FPK adaptation is separate from unsupported online update'))
-    await action(f.core, 'boot')
-    const doctor = JSON.parse(fs.readFileSync(path.join(path.dirname(f.core.gatewayEntry(CORE_VERSION)), 'doctor-called.json'), 'utf8'))
-    assert.deepEqual(doctor.args, ['doctor', '--fix', '--non-interactive', '--yes'])
-    assert.equal(doctor.state, f.core.stateDir)
-    assert.equal(doctor.config, f.core.env.OPENCLAW_CONFIG_PATH)
-    assert.equal(doctor.supervisor, 'external')
+    const install = f.core.install.bind(f.core)
+    const download = Promise.withResolvers()
+    t.mock.method(f.core, 'install', async version => {
+      if (version === CORE_VERSION) await download.promise
+      return install(version)
+    })
+    assert.equal(f.core.action('boot'), true)
+    const job = f.core.job
+    try {
+      const initial = f.core.status()
+      assert.equal(initial.chatBlocked, true)
+      assert.equal(initial.maintenance.stage, 'preparing-framework')
+      assert.equal(initial.maintenance.target, CORE_VERSION)
+      await until(f.core, () => f.core.status().maintenance?.stage === 'downloading')
+      const downloading = f.core.status()
+      assert.equal(downloading.available, true, 'old Gateway can finish existing tasks')
+      assert.equal(downloading.chatBlocked, true, 'new sessions wait for the update')
+      assert.equal(downloading.maintenance.startedAt, initial.maintenance.startedAt)
+    } finally {
+      download.resolve()
+      await job
+    }
+    assert.equal(fs.existsSync(path.join(path.dirname(f.core.gatewayEntry(CORE_VERSION)), 'doctor-called.json')), false)
     assert.equal(f.core.available, true, f.core.tail())
+    assert.equal(f.core.status().chatBlocked, false)
     assert.equal(f.core.version, candidateFails ? previous : CORE_VERSION)
     assert.equal(fs.existsSync(f.core.frameworkRequestFile), false)
     assert.equal(JSON.parse(fs.readFileSync(f.core.frameworkAttemptFile, 'utf8')).outcome, candidateFails ? 'not-applied' : 'complete')
     if (!candidateFails) {
       const restore = f.core.snapshots().find(item => item.version === previous)
       assert.equal(f.core.action('rollback', restore.version, { restore }), true)
+      assert.equal(f.core.status().chatBlocked, true)
       await f.core.job
+      assert.equal(f.core.status().chatBlocked, false)
       assert.equal(f.core.version, previous)
     }
     await f.core.close()
@@ -865,20 +939,31 @@ for (const previous of frameworkPolicy.from) for (const candidateFails of [false
   })
 }
 
+async function doctorFixture(t, mode) {
+  // Exercise the opt-in repair path independently of the current FPK policy.
+  const f = await fixture(t)
+  const previous = frameworkPolicy.from.at(-1)
+  f.install(previous);f.install(CORE_VERSION, mode)
+  f.core.version = previous
+  await action(f.core, 'boot')
+  return { ...f, previous }
+}
+
 for (const mode of ['doctor-fail', 'doctor-hang']) {
-  test('FPK Doctor ' + mode + ' restores the old database before reopening ingress', async t => {
-    const f = await fixture(t, { officialUpdates: true })
-    const previous = frameworkPolicy.from.at(-1)
-    f.install(previous);f.install(CORE_VERSION, mode)
-    f.core.version = previous
-    f.core.frameworkVersion = frameworkPolicy.framework
+  test('Doctor ' + mode + ' restores the old database before reopening ingress', async t => {
+    const f = await doctorFixture(t, mode)
+    const { previous } = f
     writeState(f.core, 'sample.txt', 'old database')
     writeState(f.core, 'workspace/project.txt', 'latest user project')
-    fs.writeFileSync(f.core.frameworkRequestFile, JSON.stringify(frameworkPolicy))
-    const job = action(f.core, 'boot')
+    const job = action(f.core, 'update', CORE_VERSION, { doctorFix: true })
+    const called = path.join(path.dirname(f.core.gatewayEntry(CORE_VERSION)), 'doctor-called.json')
+    await until(f.core, () => fs.existsSync(called))
+    const doctor = JSON.parse(fs.readFileSync(called, 'utf8'))
+    assert.deepEqual(doctor.args, ['doctor', '--fix', '--non-interactive', '--yes'])
+    assert.equal(doctor.state, f.core.stateDir)
+    assert.equal(doctor.config, f.core.env.OPENCLAW_CONFIG_PATH)
+    assert.equal(doctor.supervisor, 'external')
     if (mode === 'doctor-hang') {
-      const called = path.join(path.dirname(f.core.gatewayEntry(CORE_VERSION)), 'doctor-called.json')
-      await until(f.core, () => fs.existsSync(called))
       assert.ok(f.core.job, 'Doctor remains under maintenance until explicitly canceled')
       f.core.cancelUpdate = true
     }
@@ -897,12 +982,8 @@ for (const mode of ['doctor-fail', 'doctor-hang']) {
 }
 
 test('Doctor reports its real substep without treating elapsed heartbeats as a new step', async t => {
-  const f = await fixture(t, { officialUpdates: true })
-  const previous = frameworkPolicy.from.at(-1)
-  f.install(previous);f.install(CORE_VERSION, 'doctor-progress')
-  f.core.version = previous;f.core.frameworkVersion = frameworkPolicy.framework
-  fs.writeFileSync(f.core.frameworkRequestFile, JSON.stringify(frameworkPolicy))
-  const job = action(f.core, 'boot')
+  const f = await doctorFixture(t, 'doctor-progress')
+  const job = action(f.core, 'update', CORE_VERSION, { doctorFix: true })
   await until(f.core, () => f.core.maintenance?.doctorStep === '保留修复前数据库')
   assert.equal(f.core.maintenance.stage, 'doctor')
   assert.ok(Number.isFinite(f.core.maintenance.doctorStartedAt))
@@ -915,14 +996,11 @@ test('Doctor reports its real substep without treating elapsed heartbeats as a n
 })
 
 test('stopping the app during Doctor restores state before the next ordinary boot', async t => {
-  const f = await fixture(t, { officialUpdates: true })
-  const previous = frameworkPolicy.from.at(-1)
-  f.install(previous);f.install(CORE_VERSION, 'doctor-hang')
-  f.core.version = previous;f.core.frameworkVersion = frameworkPolicy.framework
+  const f = await doctorFixture(t, 'doctor-hang')
+  const { previous } = f
   writeState(f.core, 'sample.txt', 'old database')
   writeState(f.core, 'workspace/project.txt', 'user project')
-  fs.writeFileSync(f.core.frameworkRequestFile, JSON.stringify(frameworkPolicy))
-  assert.equal(f.core.action('boot'), true)
+  assert.equal(f.core.action('update', CORE_VERSION, { doctorFix: true }), true)
   const called = path.join(path.dirname(f.core.gatewayEntry(CORE_VERSION)), 'doctor-called.json')
   await until(f.core, () => fs.existsSync(called))
   await f.core.close()

@@ -29,7 +29,9 @@ let checkedUpstream = false
 let upstreamError = ''
 let navigationReady = false
 const maintenancePhases = {
+  'preparing-framework': '准备自动升级',
   checking: '检查升级条件', downloading: '下载安装内核', waiting: '等待活动任务结束',
+  preflighting: '检查数据库兼容性',
   snapshot: '创建回滚快照', doctor: '适配会话数据库', starting: '启动目标内核',
   verifying: '验证网关与会话库', recovering: '恢复旧版中', canceling: '取消数据库适配',
 }
@@ -48,7 +50,9 @@ function maintenanceView() {
   let text = update.message || '', reason = '', tone = 'ok'
   if (active) {
     const messages = {
-      checking: '正在通过官方命令检查升级条件。',
+      'preparing-framework': '框架安装包将自动升级到 OpenClaw ' + target + '。正在启动当前内核并准备升级。',
+      checking: update.message || '正在核对上游正式版。',
+      preflighting: update.message || '正在检查数据库兼容性。',
       downloading: '正在下载并安装 OpenClaw ' + target + (status.available ? '，当前 ' + current + ' 继续运行。' : '。'),
       waiting: '正在等待活动任务结束，尚未切换内核。' + (Number.isFinite(update.activeCount) ? ' 活动任务：' + update.activeCount + ' 项。' : ''),
       snapshot: '正在创建并校验回滚快照，服务暂时停止。',
@@ -59,6 +63,8 @@ function maintenanceView() {
       canceling: '正在停止官方 Doctor，随后恢复 OpenClaw ' + (update.previous || current) + '。',
     }
     text = messages[update.stage]
+  } else if (update.stage === 'awaiting-confirmation') {
+    text = 'OpenClaw ' + target + ' 的数据库兼容性检查通过。请在「更新内核」中确认切换。'
   } else if (update.stage === 'rolled-back') {
     text = status.available ? '已恢复至 OpenClaw ' + current + '，当前服务正常。' : '旧版数据已恢复，OpenClaw ' + current + ' 当前状态：' + (phases[status.phase] || '尚未就绪') + '。'
     tone = status.failure || status.phase === 'failed' ? 'error' : 'ok'
@@ -102,8 +108,10 @@ function scrollLogToEnd() {
 function statusText() {
   if (!status) return '正在连接…'
   const update = status.maintenance
-  if (status.busy && maintenancePhases[update?.stage]) return maintenancePhases[update.stage] + ' · 目标 ' +
-    (['recovering', 'canceling'].includes(update.stage) ? update.previous || status.version : update.target)
+  if (status.busy && maintenancePhases[update?.stage]) {
+    const target = ['recovering', 'canceling'].includes(update.stage) ? update.previous || status.version : update.target
+    return maintenancePhases[update.stage] + (target ? ' · 目标 ' + target : '')
+  }
   const parts = [status.available ? '运行正常' : phases[status.phase], status.version]
   if (status.paused) parts.push('自动恢复已暂停')
   if (status.retryAt) parts.push(Math.max(0, Math.ceil((status.retryAt - Date.now()) / 1000)) + ' 秒后重试')
@@ -119,6 +127,8 @@ function canStop() {
 function render() {
   dockToolbar()
   const running = status?.phase === 'running' && status.available !== false
+  const prepared = status?.preparedKernel
+  const canOpenChat = running && !status.chatBlocked && !prepared
   const locked = pending || !status || status.busy
   const update = status?.maintenance
   const view = maintenanceView()
@@ -129,21 +139,21 @@ function render() {
   power.textContent = canStop() ? '停止' : '启动'
   power.disabled = locked
   restart.disabled = locked || !running
-  if (running) standalone.href = standaloneURL
+  if (canOpenChat) standalone.href = standaloneURL
   else standalone.removeAttribute('href')
-  standalone.setAttribute('aria-disabled', String(!running))
+  standalone.setAttribute('aria-disabled', String(!canOpenChat))
 
   if (!running && generation !== undefined) {
     frame.removeAttribute('src')
     generation = undefined
   }
-  if (running && generation !== status.generation) {
+  if (canOpenChat && generation !== status.generation) {
     generation = status.generation
     showLogs = false
     frame.src = './open'
   }
   const wasLogHidden = log.hidden
-  consolePanel.hidden = running && !showLogs
+  consolePanel.hidden = canOpenChat && !showLogs
   log.hidden = consolePanel.hidden
   frame.hidden = !consolePanel.hidden
   logs.setAttribute('aria-pressed', String(!consolePanel.hidden))
@@ -151,8 +161,13 @@ function render() {
   paintMaintenance('update-status', view)
   const findings = update?.audit?.findings || []
   byId('audit-summary').textContent = update?.audit ? 'Gateway 与会话库读取通过。兼容性提示：' + findings.length + ' 项。\n' + findings.map(f => (f.severity === 'error' ? '错误：' : '提示：') + f.message).join('\n') : ''
+  const versionInput = byId('target-version')
+  if (prepared) versionInput.value = prepared.target
+  versionInput.readOnly = Boolean(prepared)
+  byId('force-update').disabled = !prepared || locked
+  byId('apply-update').textContent = prepared ? '确认切换' : '检查兼容性'
   byId('apply-update').disabled = locked || !running
-  byId('cancel-update').disabled = !status?.busy || pending || !['checking', 'downloading', 'waiting', 'doctor'].includes(update?.stage)
+  byId('cancel-update').disabled = pending || (!prepared && (!status?.busy || !['checking', 'downloading', 'waiting', 'preflighting', 'doctor'].includes(update?.stage)))
   byId('cancel-update').textContent = update?.stage === 'doctor' ? '取消适配并恢复旧版' : '取消更新'
   byId('framework-version').textContent = status?.frameworkVersion && status.frameworkVersion !== 'unknown' ? status.frameworkVersion : '未知'
   byId('core-version').textContent = status?.version || '未知'
@@ -160,7 +175,7 @@ function render() {
   byId('upstream-version').textContent = versions?.latest || (checkingUpstream ? '检测中…' : '尚未检测')
   byId('check-upstream').disabled = !status || checkingUpstream
   const canUpdate = versions?.current === status?.version && versions?.updateAvailable
-  byId('console-update').disabled = locked || !running || !canUpdate
+  byId('console-update').disabled = locked || !running || (!canUpdate && !prepared)
   byId('console-update').title = !running ? '启动服务后可更新内核' : !canUpdate ? '检测到新版本后可更新' : '更新到 ' + versions.latest
   byId('console-rollback').disabled = locked || !status?.rollback
   byId('console-rollback').title = status?.rollback ? '恢复到 ' + status.rollback.version + ' 并启动' : '暂无经过校验的上次回滚快照'
@@ -243,8 +258,9 @@ async function checkUpstream() {
 byId('check-upstream').addEventListener('click', checkUpstream)
 byId('console-update').addEventListener('click', () => {
   const versions = status?.upstream || upstream
-  if (!versions?.updateAvailable || versions.current !== status?.version) return
-  byId('target-version').value = versions.latest
+  const prepared = status?.preparedKernel
+  if (!prepared && (!versions?.updateAvailable || versions.current !== status?.version)) return
+  byId('target-version').value = prepared?.target || versions.latest
   byId('force-update').checked = false
   showMaintenance()
 })
@@ -297,13 +313,18 @@ async function showMaintenance() {
 byId('updates').addEventListener('click', showMaintenance)
 byId('close-maintenance').addEventListener('click', () => maintenance.close())
 byId('apply-update').addEventListener('click', () => {
+  const prepared = status?.preparedKernel
+  if (prepared) {
+    const force = byId('force-update').checked
+    if (force && !window.confirm('确定中断活动任务和终端，并切换版本？待保存数据仍须先完成写入。')) return
+    action('activate', { approval: prepared.id, force: force ? '1' : '0' })
+    return
+  }
   const version = byId('target-version').value.trim()
   if (!/^\d{4}\.\d{1,2}\.\d{1,3}(?:-\d{1,3})?$/.test(version)) {
     paintMaintenance('update-status', { text: '请填写有效版本号。', tone: 'error', reason: '', elapsed: '' });return
   }
-  const force = byId('force-update').checked
-  if (force && !window.confirm('确定中断活动任务和终端，并切换版本？待保存数据仍须先完成写入。')) return
-  action('update', { version, force: force ? '1' : '0' })
+  action('update', { version })
 })
 byId('cancel-update').addEventListener('click', () => action('cancel-update'))
 

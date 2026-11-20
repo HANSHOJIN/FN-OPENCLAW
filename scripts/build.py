@@ -98,13 +98,14 @@ def verify(output):
             core_version = re.search(r"CORE_VERSION = '([^']+)'", defaults).group(1)
             if policy['framework'] != package_version or policy['target'] != core_version:
                 raise ValueError('框架适配目标与安装包或默认内核版本不一致。')
-            if policy.get('from') != ['2026.11.3', '2026.11.4']:
+            if policy.get('from') != ['2026.11.5']:
                 raise ValueError('尚未验证的内核迁移路径。')
-            if policy.get('doctorFix') is not True:
-                raise ValueError('缺少本版必需的 Doctor 数据库适配步骤。')
+            if policy.get('doctorFix') is not False:
+                raise ValueError('本版内核切换只执行只读验收，不运行 Doctor 修复。')
             for file in ('ui/config', 'shell/server.mjs', 'shell/core.mjs', 'shell/versions.mjs', 'shell/maintenance.mjs', 'shell/index.html',
                          'shell/shell.js', 'shell/shell.css', 'shell/titlebar.js', 'shell/titlebar.css',
-                         'shell/state-snapshot.mjs', 'shell/official-update.mjs'):
+                         'shell/state-snapshot.mjs', 'shell/official-update.mjs', 'shell/kernel-compatibility.mjs',
+                         'fn-update/index.mjs', 'fn-update/package.json', 'fn-update/openclaw.plugin.json'):
                 app.getmember(file)
             runtime = app.extractfile('node-runtime.tar.gz')
             if hashlib.file_digest(runtime, 'sha256').hexdigest() != NODE_SHA256:

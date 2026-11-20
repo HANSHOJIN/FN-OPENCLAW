@@ -24,6 +24,7 @@ export function assessOfficialPlan(report) {
   // dry-run is a preview, not candidate-owned admission. It must not authorise
   // our old npm/copy-state flow, even if a future CLI emits a successful plan.
   const code = migrationRequired ? 'session-migration-required' :
+    reasons.includes('external-supervisor-update-required') ? 'external-supervisor-update-required' :
     reasons.includes('unmanaged-package-install') || reasons.includes('installation-unclassified') ? 'unmanaged-package-install' :
       report?.status === 'error' || report?.status === 'failed' ? 'official-update-refused' : 'official-handoff-unavailable'
   return {

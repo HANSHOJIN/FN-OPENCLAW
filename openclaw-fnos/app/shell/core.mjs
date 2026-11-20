@@ -1,5 +1,6 @@
 import { spawn } from 'node:child_process'
 import { randomBytes } from 'node:crypto'
+import { createRequire } from 'node:module'
 import fs from 'node:fs'
 import path from 'node:path'
 import net from 'node:net'
@@ -9,7 +10,8 @@ import { INSTANCE_ENV, findGatewayProcesses, isSameProcess, ownsGatewayListener 
 import { inspectTree, prepareUpgrade, auditUpgrade, snapshotName } from './maintenance.mjs'
 import { validVersion, frameworkVersion, compareVersions, UpstreamVersions } from './versions.mjs'
 import { preservedStatePaths, normalizePreserved, cloneRuntimeState, movePreservedState } from './state-snapshot.mjs'
-import { inspectOfficialUpdate } from './official-update.mjs'
+import { FRAMEWORK_MESSAGE, inspectOfficialUpdate } from './official-update.mjs'
+import { kernelConfigHash, preflightKernelDatabases, verifyLocalDatabaseConfig } from './kernel-compatibility.mjs'
 
 const RETRY_DELAYS = [2000, 5000, 15000, 30000]
 const STABLE_UPTIME = 60000
@@ -61,7 +63,7 @@ async function stopProcess(exited, send) {
 }
 
 export class Core {
-  constructor({ data, config, home, npm, ca, port = CORE_PORT }) {
+  constructor({ data, config, home, npm, ca, updatePlugin, port = CORE_PORT }) {
     this.data = data
     this.port = port
     this.stateDir = path.join(data, 'state')
@@ -77,6 +79,7 @@ export class Core {
     this.frameworkAttemptFile = path.join(data, 'framework-update-attempt.json')
     this.paused = fs.existsSync(this.pauseFile)
     this.npm = npm
+    this.updatePlugin = updatePlugin
     this.phase = 'stopped'
     this.generation = 0
     this.retryCount = 0
@@ -135,6 +138,20 @@ export class Core {
   }
 
   get available() { return this.phase === 'running' && !this.maintenance?.blockIngress }
+
+  // Existing clients can drain their work before maintenance stops the Gateway.
+  get chatBlocked() { return Boolean(this.preparingFrameworkUpgrade || this.maintenanceAction) }
+
+  cancelMaintenance() {
+    this.cancelUpdate = true
+    if (this.inspector && ['checking', 'preflighting'].includes(this.maintenance?.stage)) {
+      void this.stopChild(this.inspector).catch(() => {})
+    }
+    if (!this.job && this.preparedKernel) {
+      this.preparedKernel = undefined
+      this.finishMaintenance({ stage: 'deferred', message: '已取消更新，当前版本继续运行。' })
+    }
+  }
 
   updateProgress(value) {
     const now = Date.now()
@@ -302,7 +319,9 @@ export class Core {
       phase: this.phase, version: this.version, generation: this.generation, busy: Boolean(this.job),
       paused: this.paused, failure: this.failure, retryAt: this.retryAt ?? null,
       retryExhausted: this.phase === 'failed' && !this.paused && this.retryCount >= RETRY_DELAYS.length,
-      available: this.available, maintenance: this.maintenance ?? null,
+      available: this.available, chatBlocked: this.chatBlocked,
+      maintenance: this.preparingFrameworkUpgrade ?? this.maintenance ?? null,
+      preparedKernel: this.preparedKernel ? { id: this.preparedKernel.id, target: this.preparedKernel.target } : null,
       frameworkVersion: this.frameworkVersion, rollback: this.rollbackPoint(),
       upstream: this.upstreamStatus(),
     }
@@ -377,22 +396,32 @@ export class Core {
     return child
   }
 
-  async install(version) {
+  async install(version, { engineStrict = false } = {}) {
     const dir = path.join(this.runtimes, version)
     const module = path.join(dir, 'node_modules', 'openclaw')
     const entry = this.gatewayEntry(version)
-    if (fs.existsSync(path.join(dir, 'installed')) && readJSON(path.join(module, 'package.json'))?.version === version && fs.existsSync(entry)) return entry
+    const installed = () => {
+      const manifest = readJSON(path.join(module, 'package.json'))
+      if (manifest?.version !== version || !fs.existsSync(entry)) return false
+      if (engineStrict && this.npm && (typeof manifest.engines?.node !== 'string' ||
+          !createRequire(this.npm)('semver').satisfies(process.version, manifest.engines.node))) {
+        throw new Error('框架的 Node.js 无法满足候选内核要求。' + FRAMEWORK_MESSAGE)
+      }
+      return true
+    }
+    if (fs.existsSync(path.join(dir, 'installed')) && installed()) return entry
     if (!this.gateway) this.phase = 'installing'
     this.log('正在下载 OpenClaw ' + version + '，首次安装可能需要几分钟。')
     fs.mkdirSync(dir, { recursive: true, mode: 0o700 })
     const installEnv = { ...this.env }
     delete installEnv.OPENCLAW_GATEWAY_TOKEN
     const child = this.run([this.npm, 'install', '--prefix', dir, '--cache', path.join(this.data, 'npm-cache'),
-      '--registry=https://registry.npmjs.org', '--no-audit', '--no-fund', '--save-exact', 'openclaw@' + version], installEnv)
+      '--registry=https://registry.npmjs.org', '--no-audit', '--no-fund', '--save-exact',
+      ...(engineStrict ? ['--engine-strict'] : []), 'openclaw@' + version], installEnv)
     this.installer = child
     const result = await child.finished
     this.installer = undefined
-    if (result.code !== 0 || readJSON(path.join(module, 'package.json'))?.version !== version || !fs.existsSync(entry)) {
+    if (result.code !== 0 || !installed()) {
       throw new Error('OpenClaw 下载或安装失败。可在日志中查看详情。')
     }
     fs.writeFileSync(path.join(dir, 'installed'), version)
@@ -512,6 +541,31 @@ export class Core {
     }
   }
 
+  async linkUpdateCommand(version) {
+    if (!this.updatePlugin || compareVersions(version, '2026.11.6') < 0) return
+    const marker = path.join(this.stateDir, '.fn-update-linked')
+    if (fs.existsSync(marker) || this.attemptedUpdateCommand) return
+    this.attemptedUpdateCommand = true
+    // The CLI requires explicit consent for local sources. Only link the FPK's
+    // own fixed plugin directory; registry/install-policy blocks still apply.
+    const child = this.run([this.gatewayEntry(version), 'plugins', 'install', '--link', '--force',
+      '--acknowledge-install-policy-warning', '--accept-capabilities', this.updatePlugin], {
+      ...this.env, OPENCLAW_SUPERVISOR_MODE: 'external',
+    })
+    this.inspector = child
+    const timer = setTimeout(() => { void this.stopChild(child).catch(() => {}) }, 60000)
+    try {
+      const result = await child.finished
+      if (result.code === 0) fs.writeFileSync(marker, '', { mode: 0o600 })
+      else this.log('未能注册 /fn_update，查看日志中的插件安装信息。')
+    } catch (error) {
+      this.log('未能登记 /fn_update：' + error.message)
+    } finally {
+      clearTimeout(timer)
+      if (this.inspector === child) this.inspector = undefined
+    }
+  }
+
   async startCore(version = this.version, entry, { verifyCore = false } = {}) {
     entry ??= await this.install(version)
     if (this.closing) return
@@ -528,6 +582,8 @@ export class Core {
     }
     // Fail if someone else already owns this port, rather than proxying to them.
     await this.assertPortFree()
+    // Link once on a normal boot. A candidate launch must not rewrite config.
+    if (!verifyCore) await this.linkUpdateCommand(version)
     if (this.closing) return
     if (!fs.existsSync(this.activeFile)) saveJSON(this.activeFile, { version })
     const instance = randomBytes(16).toString('hex')
@@ -583,42 +639,77 @@ export class Core {
     this.phase = 'stopped'
   }
 
-  async update(target, { force = false } = {}) {
-    if (!validVersion(target)) throw new Error('版本格式无效。')
-    if (target === this.version) throw new Error('已是指定版本。')
+  async update(target) {
     this.cancelUpdate = false
+    this.preparedKernel = undefined
     this.maintenance = undefined
-    this.updateProgress({ stage: 'checking', target, force, blockIngress: false,
-      message: '正在通过官方 update 命令检查升级条件。' })
-    let check
-    try { check = await inspectOfficialUpdate(this, target) }
-    catch {
-      this.finishMaintenance({ stage: 'deferred', blockIngress: false,
-        message: '官方升级检查未完成，请稍后重试或等待 FN-OPENCLAW 框架安装包。' })
+    this.updateProgress({ stage: 'checking', target, blockIngress: false, message: '正在检查正式版及更新条件。' })
+    try {
+      const upstream = await this.checkUpstream()
+      target ??= upstream.latest
+      if (!validVersion(target) || target !== upstream.latest) {
+        throw new Error('请选择上游当前的正式版本。')
+      }
+      if (compareVersions(target, this.version) !== 1) {
+        this.finishMaintenance({ stage: 'deferred', target, message: '当前内核已是最新版本或高于上游正式版。' })
+        return
+      }
+      this.updateProgress({ target })
+      const check = await inspectOfficialUpdate(this, target).catch(() => {
+        throw new Error('官方升级检查未完成，请稍后重试。')
+      })
+      this.updateProgress({ check })
+      if (check.migrationRequired || !['unmanaged-package-install', 'external-supervisor-update-required'].includes(check.code)) {
+        throw new Error(check.message)
+      }
+      if (this.cancelUpdate || this.closing) throw new Error('已取消更新，当前版本继续运行。')
+      const configHash = kernelConfigHash(this)
+      verifyLocalDatabaseConfig((await this.rpc('config.get')).config)
+      if (kernelConfigHash(this) !== configHash) throw new Error('配置在检查期间已变更，请重新检查。')
+      this.updateProgress({ stage: 'downloading', previous: this.version, message: '正在准备候选内核。' })
+      const entry = await this.install(target, { engineStrict: true })
+      this.updateProgress({ stage: 'preflighting', message: '候选内核正在验证数据库副本。' })
+      const agents = await preflightKernelDatabases(this, target)
+      if (!this.available || kernelConfigHash(this) !== configHash) throw new Error('服务或配置已变更，请重新检查。')
+      const prepared = { id: randomBytes(16).toString('hex'), target, previous: this.version, configHash, entry }
+      this.updateProgress({ stage: 'awaiting-confirmation', agents, message: '兼容性检查通过，请在控制台确认切换。' })
+      this.preparedKernel = prepared
+    } catch (error) {
+      const message = this.cancelUpdate || this.closing ? '已取消更新，当前版本继续运行。' : error.message
+      this.finishMaintenance({ stage: 'deferred', blockIngress: false, message })
+      this.log(message)
+    }
+  }
+
+  async activateKernel(prepared, { force = false } = {}) {
+    try {
+      if (!this.available || kernelConfigHash(this) !== prepared.configHash) {
+        throw new Error('服务或配置已变更，请重新检查。')
+      }
+    } catch (error) {
+      this.finishMaintenance({ stage: 'deferred', message: error.message })
       return
     }
-    if (this.closing) return
-    if (this.cancelUpdate) {
-      this.finishMaintenance({ stage: 'deferred', blockIngress: false, message: '已取消更新，当前版本继续运行。' })
-      return
+    await this.switchRuntime(prepared.target, { force, prepared })
+  }
+
+  frameworkUpgradePolicy() {
+    const request = readJSON(this.frameworkRequestFile)
+    if (!request) return
+    const policy = readJSON(new URL('../framework-upgrade.json', import.meta.url))
+    if (!policy || policy.framework !== this.frameworkVersion || policy.target !== CORE_VERSION ||
+        request.framework !== policy.framework || request.target !== policy.target || !Array.isArray(policy.from)) {
+      throw new Error('安装包的内核适配记录不匹配，当前版本继续运行。')
     }
-    // The shipped per-version npm layout has no official mutable/global owner.
-    // Never fall back to installing another core and migrating user state here.
-    this.finishMaintenance({ stage: 'deferred', blockIngress: false, check, message: check.message })
-    this.log(check.message)
+    return policy
   }
 
   async applyFrameworkUpgrade() {
     if (this.paused || this.phase !== 'running' || this.closing) return
-    let request, policy
+    let policy
     try {
-      request = readJSON(this.frameworkRequestFile)
-      if (!request) return
-      policy = readJSON(new URL('../framework-upgrade.json', import.meta.url))
-      if (!policy || policy.framework !== this.frameworkVersion || policy.target !== CORE_VERSION ||
-          request.framework !== policy.framework || request.target !== policy.target || !Array.isArray(policy.from)) {
-        throw new Error('安装包的内核适配记录不匹配，当前版本继续运行。')
-      }
+      policy = this.frameworkUpgradePolicy()
+      if (!policy) return
       // Consume before doing work: interrupted or failed package handoffs must
       // not repeatedly migrate state at every subsequent service restart.
       fs.renameSync(this.frameworkRequestFile, this.frameworkAttemptFile)
@@ -641,8 +732,11 @@ export class Core {
     }
     this.log('正在应用框架安装包的 OpenClaw ' + policy.target + ' 适配。')
     record('starting')
+    const startedAt = this.preparingFrameworkUpgrade?.startedAt
+    this.maintenanceAction = true
+    this.preparingFrameworkUpgrade = undefined
     try {
-      await this.switchRuntime(policy.target, { doctorFix: policy.doctorFix === true })
+      await this.switchRuntime(policy.target, { doctorFix: policy.doctorFix === true, startedAt, registerUpdateCommand: true })
       record(this.version === policy.target && this.available ? 'complete' : 'not-applied')
     } catch (error) {
       record('failed')
@@ -706,14 +800,14 @@ export class Core {
     }
   }
 
-  // Retained for verified rollback and framework-controlled compatibility tests.
-  // The public kernel-update action cannot invoke this state-switching engine.
-  async switchRuntime(target, { force = false, restore, allowOffline = false, doctorFix = false } = {}) {
+  async switchRuntime(target, { force = false, restore, allowOffline = false, doctorFix = false,
+    startedAt = Date.now(), prepared, registerUpdateCommand = false } = {}) {
     if (!validVersion(target)) throw new Error('版本格式无效。')
     if (target === this.version) throw new Error('已是指定版本。')
     this.cancelUpdate = false
     this.maintenance = undefined
-    this.updateProgress({ stage: 'downloading', target, previous: this.version, force, message: '正在准备目标版本。', blockIngress: false })
+    this.updateProgress({ stage: 'downloading', target, previous: this.version, startedAt, force,
+      message: '正在准备目标版本。', blockIngress: false })
     // Install the candidate before taking the live state offline.
     let entry
     try {
@@ -722,7 +816,7 @@ export class Core {
         const actual = await inspectTree(path.join(this.data, restore.name))
         if (actual.sha256 !== restore.sha256) throw new Error('快照校验未通过，已取消回退。')
       }
-      entry = await this.install(target)
+      entry = prepared?.entry ?? await this.install(target)
     }
     catch (error) {
       this.updateProgress({ stage: 'failed', message: error.message, reason: error.message })
@@ -744,6 +838,13 @@ export class Core {
       await this.assertPortFree()
       if (this.closing) return
       this.recoverUpdate()
+      if (prepared) {
+        if (kernelConfigHash(this) !== prepared.configHash) throw new Error('配置已变更，请重新检查。')
+        this.updateProgress({ stage: 'preflighting', message: '停机后正在核对最新数据库副本。' })
+        await preflightKernelDatabases(this, target)
+        if (kernelConfigHash(this) !== prepared.configHash) throw new Error('配置已变更，请重新检查。')
+        this.updateProgress({ stage: 'snapshot', message: '正在创建并校验回滚快照。' })
+      }
       const snapshot = 'snapshot-' + randomBytes(8).toString('hex')
       const backup = path.join(this.data, snapshot)
       fs.mkdirSync(this.stateDir, { recursive: true, mode: 0o700 })
@@ -765,6 +866,7 @@ export class Core {
         this.updateProgress({ snapshot, bytes: verified.bytes, verified: true })
         await this.repairCore(target)
       }
+      if (registerUpdateCommand) await this.linkUpdateCommand(target)
       this.updateProgress({ stage: 'starting', snapshot, bytes: verified.bytes, verified: true, message: '正在启动并验收目标版本。' })
       await this.startCore(target, entry, { verifyCore: true })
       if (this.phase !== 'running') throw new Error('候选版本未完成启动。')
@@ -814,14 +916,36 @@ export class Core {
   }
 
   action(action, version, options) {
-    if (this.job || this.closing || (this.paused && ['boot', 'recover', 'update'].includes(action))) return false
+    if (this.job || this.closing || (this.paused && ['boot', 'recover', 'update', 'activate'].includes(action))) return false
+    const approval = this.preparedKernel
+    if (action === 'activate' && (!approval || approval.id !== options?.approval || approval.previous !== this.version)) return false
     if (action === 'start' && this.phase === 'running') return true
     if (action === 'stop') this.setPaused(true)
     if (action === 'start' || action === 'restart') this.setPaused(false)
     this.cancelRecovery()
     if (['start', 'stop', 'restart', 'rollback'].includes(action)) this.retryCount = 0
+    this.maintenanceAction = ['update', 'activate', 'rollback'].includes(action)
+    if (this.preparedKernel && action !== 'update') {
+      this.preparedKernel = undefined
+      if (action !== 'activate') {
+        this.finishMaintenance({ stage: 'deferred', message: '检查结果已失效，需要切换版本时请重新检查。' })
+      }
+    }
+    if (action === 'boot' || action === 'start') {
+      try {
+        const policy = this.frameworkUpgradePolicy()
+        if (policy && this.version !== policy.target && policy.from.includes(this.version)) {
+          this.preparingFrameworkUpgrade = {
+            stage: 'preparing-framework', target: policy.target, previous: this.version, startedAt: Date.now(),
+          }
+        }
+      } catch {
+        // Report invalid requests in applyFrameworkUpgrade after the installed core is available.
+      }
+    }
     this.job = Promise.resolve().then(async () => {
       if (action === 'update') return this.update(version, options)
+      if (action === 'activate') return this.activateKernel(approval, options)
       if (action === 'rollback') {
         if (!options?.restore) throw new Error('请选择已校验的回滚快照。')
         return this.switchRuntime(version, { ...options, allowOffline: true })
@@ -856,6 +980,8 @@ export class Core {
       this.recordFailure(message)
     }).finally(() => {
       this.job = undefined
+      this.maintenanceAction = false
+      this.preparingFrameworkUpgrade = undefined
       this.scheduleRecovery()
     })
     return true

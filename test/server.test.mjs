@@ -99,6 +99,44 @@ test('navigation bootstrap supports LAN and port-stripped relay entrances', asyn
   }
 })
 
+test('FN Connect can switch between remote HTTPS and LAN HTTP transport without changing the browser origin', async t => {
+  const request = await fixture(t)
+  const origin = 'https://' + relay + ':39419'
+  const lan = { ...admin, host: 'localhost', 'x-forwarded-proto': 'http' }
+  const remote = { ...lan, 'x-forwarded-proto': 'https' }
+  const proofPath = PREFIX + '/api/navigation-proof'
+  const handshake = { connection: 'Upgrade', upgrade: 'websocket' }
+  const old = await request(PREFIX + '/open', { ...remote, referer: origin + PREFIX + '/' })
+  const cookie = old.headers['set-cookie'][0].split(';')[0]
+  assert.equal((await request(UI_PATH, { ...remote, origin, cookie, ...handshake })).statusCode, 101)
+  assert.equal((await request(UI_PATH, { ...lan, origin, cookie, ...handshake })).statusCode, 101)
+
+  const navigation = await ticket(request, lan)
+  const bootstrap = { ...lan, origin, referer: origin + PREFIX + '/', 'sec-fetch-site': 'same-origin',
+    'x-fn-openclaw-navigation': navigation }
+  const proof = await request(proofPath, bootstrap, 'POST')
+  assert.equal(proof.statusCode, 200)
+  assert.match(proof.headers['set-cookie'][0], /; HttpOnly; SameSite=Strict; Secure$/)
+  const fresh = proof.headers['set-cookie'][0].split(';')[0]
+  assert.equal((await request(asset, { ...lan, origin, cookie: fresh })).statusCode, 200)
+  assert.equal((await request(asset, { ...lan, origin, referer: origin + PREFIX + '/', 'sec-fetch-site': 'same-origin' })).statusCode, 403)
+  for (const changes of [
+    { 'x-fn-openclaw-navigation': '' }, { 'sec-fetch-site': 'cross-site' },
+    { referer: 'https://unrelated.test/' }, { origin: 'https://unrelated.test' },
+    { host: '192.168.50.76' }, { 'x-trim-isadmin': 'false' },
+  ]) {
+    const rejected = await request(proofPath, { ...bootstrap, ...changes }, 'POST')
+    assert.equal(rejected.statusCode, 403, JSON.stringify(changes))
+    assert.equal(rejected.headers['set-cookie'], undefined)
+  }
+  const ws = { ...lan, origin, cookie: fresh, ...handshake }
+  for (const changes of [
+    { cookie: '' }, { 'x-trim-userid': '1001' }, { 'x-trim-isadmin': 'false' },
+    { 'sec-fetch-site': 'cross-site' }, { host: '192.168.50.76' },
+    { origin: 'https://' + relay + ':39420' }, { origin: 'https://unrelated.test' },
+  ]) assert.equal((await request(UI_PATH, { ...ws, ...changes })).statusCode, 403, JSON.stringify(changes))
+})
+
 test('bootstrap rejects forged, expired, cross-origin or non-admin requests', async t => {
   const request = await fixture(t)
   const ingress = { ...admin, host: '127.0.0.1', 'x-forwarded-proto': 'https' }
@@ -119,7 +157,7 @@ test('bootstrap rejects forged, expired, cross-origin or non-admin requests', as
     { origin: '' }, { origin: 'null' }, { origin: origin + '/' },
     { origin: 'https://evil.test' }, { origin: 'http://' + relay + ':42163' },
     { host: 'other-device.app.5ddd.com' }, { host: relay + ':41001' },
-    { 'x-forwarded-proto': 'http' },
+    { 'x-forwarded-proto': 'ftp' },
   ]) {
     const response = await request(PREFIX + '/api/navigation-proof', { ...valid, ...change }, 'POST')
     assert.equal(response.statusCode, 403, JSON.stringify(change))
@@ -275,6 +313,40 @@ test('upstream discovery works with a stopped core and retains admin and origin 
   assert.equal((await request(PREFIX + '/api/upstream', {})).statusCode, 403)
   assert.equal((await request(PREFIX + '/api/upstream', { ...admin, origin: 'https://unrelated.test', 'sec-fetch-site': 'cross-site' })).statusCode, 403)
   assert.equal(calls, 1)
+})
+
+test('an automatic update keeps new chat closed while the existing Gateway serves', async t => {
+  const request = await fixture(t, {
+    available: true, chatBlocked: true,
+    status: () => ({
+      phase: 'running', version: '2026.11.5', chatBlocked: true,
+      maintenance: { stage: 'preparing-framework', target: '2026.11.6' },
+    }),
+  })
+  const context = { ...admin, host: '127.0.0.1', 'sec-fetch-site': 'same-origin' }
+  const page = await request(PREFIX + '/', context)
+  assert.equal(page.statusCode, 200)
+  assert.match(page.text, /准备自动升级 · 目标 2026\.11\.6/)
+  const entry = await request(PREFIX + '/open', context)
+  assert.equal(entry.statusCode, 503)
+  assert.match(entry.text, /正在更新或回滚/)
+  assert.equal((await request(asset, context)).statusCode, 200)
+})
+
+test('only an authenticated console action can confirm a prepared online update', async t => {
+  const id = '1'.repeat(32)
+  const actions = []
+  const request = await fixture(t, {
+    preparedKernel: { id },
+    action: (...args) => { actions.push(args); return true },
+  })
+  const headers = { ...admin, 'sec-fetch-site': 'same-origin', 'x-fn-openclaw-action': '1' }
+  const route = PREFIX + '/api/action?action=activate&approval='
+  assert.equal((await request(route + id, { ...headers, 'x-trim-isadmin': 'false' }, 'POST')).statusCode, 403)
+  assert.equal((await request(route + id, { ...headers, 'x-fn-openclaw-action': '' }, 'POST')).statusCode, 403)
+  assert.equal((await request(route + '2'.repeat(32), headers, 'POST')).statusCode, 409)
+  assert.equal((await request(route + id, headers, 'POST')).statusCode, 202)
+  assert.deepEqual(actions, [['activate', undefined, { approval: id, force: false }]])
 })
 
 test('upstream lookup failures return a clear error without exposing internal diagnostics', async t => {

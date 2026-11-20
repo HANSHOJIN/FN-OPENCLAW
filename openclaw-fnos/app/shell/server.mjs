@@ -33,18 +33,26 @@ function isRelayOrigin(origin) {
   return origin.protocol === 'https:' && /^[a-z0-9-]+\.app\.5ddd\.com$/.test(origin.hostname)
 }
 
-function isForwardedRelay(req, origin) {
-  if (!isRelayOrigin(origin) || req.headers['x-forwarded-proto'] !== 'https') return false
+function isLoopbackHost(req) {
   const host = new URL('http://' + req.headers.host).hostname
   return ['localhost', '127.0.0.1', '[::1]'].includes(host)
+}
+
+function isForwardedRelay(req, origin) {
+  return isRelayOrigin(origin) && req.headers['x-forwarded-proto'] === 'https' && isLoopbackHost(req)
+}
+
+function isLocalRelay(req, origin) {
+  // FN Connect can keep its HTTPS WebView origin while reaching fnOS over
+  // plain HTTP on Wi-Fi. Only use this path with a signed ticket or proof.
+  return isRelayOrigin(origin) && req.headers['x-forwarded-proto'] === 'http' && isLoopbackHost(req)
 }
 
 function isForwardedLAN(req, origin, desktopPort) {
   if (origin.protocol !== 'http:' || origin.port !== String(desktopPort) || net.isIP(origin.hostname) !== 4) return false
   const [a, b] = origin.hostname.split('.').map(Number)
   if (!(a === 10 || (a === 172 && b >= 16 && b <= 31) || (a === 192 && b === 168))) return false
-  const host = new URL('http://' + req.headers.host).hostname
-  return ['localhost', '127.0.0.1', '[::1]'].includes(host) && req.headers['x-forwarded-proto'] === 'http'
+  return req.headers['x-forwarded-proto'] === 'http' && isLoopbackHost(req)
 }
 
 function sameAppReferrer(req, origin) {
@@ -112,6 +120,7 @@ function navigationOrigin(req, desktopPort) {
     const origin = new URL(req.headers.origin)
     if (!['http:', 'https:'].includes(origin.protocol) || origin.origin !== req.headers.origin) return
     if (sameOrigin(req, desktopPort, { allowRelayReferrer: false }) || isForwardedRelay(req, origin) || isForwardedLAN(req, origin, desktopPort)) return origin
+    if (isLocalRelay(req, origin) && (!req.headers.referer || sameAppReferrer(req, origin))) return origin
     const host = new URL('http://' + req.headers.host)
     if (!host.port && isRelayOrigin(origin) && origin.hostname === host.hostname) return origin
   } catch { /* Missing or opaque origins cannot bootstrap a connection. */ }
@@ -167,8 +176,9 @@ function websocketOrigin(req, core, desktopPort) {
   // Chromium omits Sec-Fetch-Site on WebSocket upgrades. In that case,
   // require a proof issued to this admin on a same-origin HTTP request.
   try {
+    const origin = new URL(req.headers.origin)
     if (!sameOrigin({ headers: { ...req.headers, 'sec-fetch-site': 'same-origin' } }, desktopPort) &&
-        !isForwardedRelay(req, new URL(req.headers.origin)) && !isForwardedLAN(req, new URL(req.headers.origin), desktopPort)) return false
+        !isForwardedRelay(req, origin) && !isLocalRelay(req, origin) && !isForwardedLAN(req, origin, desktopPort)) return false
   } catch { return false }
   return hasOriginProof(req, core)
 }
@@ -221,7 +231,7 @@ function proxyHTTP(req, res, url, core, desktopPort) {
 }
 
 function acceptAction(core, res, action, version, options) {
-  if (action === 'update' && core.paused) {
+  if (['update', 'activate'].includes(action) && core.paused) {
     json(res, 409, { error: 'Gateway 已手动停止。请在维护结束后启动，再更新核心。' })
     return false
   }
@@ -283,7 +293,9 @@ export function createServer(core, { desktopPort = FNOS_DESKTOP_PORT } = {}) {
       const page = shellTemplate.replace(/__FN_OPENCLAW_(STATUS|LOG|SCRIPT|NAVIGATION)__/g, (_, key) => {
         if (key === 'SCRIPT') return shellScript
         if (key === 'NAVIGATION') return navigationTicket(req, core)
-        if (key === 'STATUS') return escapeHTML(phases[status.phase] + ' · ' + status.version)
+        if (key === 'STATUS') return escapeHTML(status.maintenance?.stage === 'preparing-framework'
+          ? '准备自动升级 · 目标 ' + status.maintenance.target
+          : phases[status.phase] + ' · ' + status.version)
         return escapeHTML(core.tail() || '暂无运行日志。')
       })
       const headers = { 'content-type': 'text/html; charset=utf-8', 'content-security-policy': shellCSP,
@@ -313,11 +325,18 @@ export function createServer(core, { desktopPort = FNOS_DESKTOP_PORT } = {}) {
     if (route === '/api/action' && req.method === 'POST') {
       if (req.headers['x-fn-openclaw-action'] !== '1') return json(res, 403, { error: '操作请求无效。' })
       const action = url.searchParams.get('action')
-      if (action === 'cancel-update') { core.cancelUpdate = true; return json(res, 200, {}) }
+      if (action === 'cancel-update') { core.cancelMaintenance(); return json(res, 200, {}) }
       if (action === 'update') {
         const version = url.searchParams.get('version')
         if (!validVersion(version)) return json(res, 400, { error: '版本格式无效。' })
-        if (acceptAction(core, res, action, version, { force: url.searchParams.get('force') === '1' })) return json(res, 202, {})
+        if (acceptAction(core, res, action, version)) return json(res, 202, {})
+        return
+      }
+      if (action === 'activate') {
+        const approval = url.searchParams.get('approval')
+        if (!/^[a-f0-9]{32}$/.test(approval ?? '')) return json(res, 400, { error: '请先完成兼容性检查。' })
+        if (approval !== core.preparedKernel?.id) return json(res, 409, { error: '检查结果已失效，请重新检查。' })
+        if (acceptAction(core, res, action, undefined, { approval, force: url.searchParams.get('force') === '1' })) return json(res, 202, {})
         return
       }
       if (action === 'rollback') {
@@ -331,6 +350,7 @@ export function createServer(core, { desktopPort = FNOS_DESKTOP_PORT } = {}) {
       return
     }
     if (route === '/open' && req.method === 'GET') {
+      if (core.chatBlocked) return json(res, 503, { error: 'OpenClaw 正在更新或回滚，请在控制台查看进度。' })
       if (core.phase !== 'running' || core.available === false) return json(res, 503, { error: 'OpenClaw 正在维护或尚未启动。' })
       const headers = { location: UI_PATH + '/#token=' + core.token, 'referrer-policy': 'same-origin', 'cache-control': 'no-store' }
       setOriginCookie(req, core, headers, desktopPort)
@@ -384,7 +404,8 @@ if (process.argv[1] && import.meta.url === pathToFileURL(path.resolve(process.ar
   // lifecycle without binding the production Gateway's listener.
   const port = Number(process.env.FN_OPENCLAW_CORE_PORT ?? CORE_PORT)
   if (!Number.isInteger(port) || port < 1024 || port > 65535) throw new Error('内部 Gateway 端口无效。')
-  const core = new Core({ data, config, home, port, npm: process.env.FN_OPENCLAW_NPM, ca: fs.existsSync(ca) && ca })
+  const core = new Core({ data, config, home, port, npm: process.env.FN_OPENCLAW_NPM, ca: fs.existsSync(ca) && ca,
+    updatePlugin: path.join(app, 'fn-update') })
   const server = createServer(core)
   const socket = path.join(app, 'app.sock')
   const adminSocket = path.join(data, 'run', 'core-control.sock')
@@ -400,7 +421,12 @@ if (process.argv[1] && import.meta.url === pathToFileURL(path.resolve(process.ar
       try { return json(res, 200, await core.checkUpstream()) }
       catch { return json(res, 503, { error: '无法检测上游版本，请检查网络后重试。' }) }
     }
-    if (req.method === 'POST' && req.url === '/cancel-update') { core.cancelUpdate = true; return json(res, 200, {}) }
+    if (req.method === 'POST' && req.url === '/cancel-update') { core.cancelMaintenance(); return json(res, 200, {}) }
+    if (req.method === 'POST' && req.url === '/prepare-latest') {
+      if (core.preparedKernel) return json(res, 200, { prepared: core.preparedKernel.target })
+      if (acceptAction(core, res, 'update')) return json(res, 202, {})
+      return
+    }
     const localURL = requestURL(req)
     if (req.method === 'POST' && localURL?.pathname.startsWith('/rollback/')) {
       const restore = core.snapshots().find(item => item.name === localURL.pathname.slice('/rollback/'.length) && item.rollbackAvailable)
@@ -418,7 +444,7 @@ if (process.argv[1] && import.meta.url === pathToFileURL(path.resolve(process.ar
     }
     const version = localURL?.pathname.slice('/update/'.length)
     if (req.method !== 'POST' || !localURL?.pathname.startsWith('/update/') || !validVersion(version)) return json(res, 400, { error: '版本格式无效。' })
-    if (acceptAction(core, res, 'update', version, { force: localURL.searchParams.get('force') === '1' })) return json(res, 202, {})
+    if (acceptAction(core, res, 'update', version)) return json(res, 202, {})
   })
   admin.listen(adminSocket)
   server.listen(socket, () => {

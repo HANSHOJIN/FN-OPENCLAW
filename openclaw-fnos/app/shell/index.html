@@ -49,7 +49,7 @@
     <p id="audit-summary"></p>
     <label>目标 OpenClaw 版本 <input id="target-version" placeholder="2026.11.3" inputmode="decimal"></label>
     <p><label><input type="checkbox" id="force-update"> 允许中断仍在运行的任务和终端</label></p>
-    <div class="maintenance-buttons"><button id="apply-update">更新</button><button id="cancel-update">取消等待</button></div>
+    <div class="maintenance-buttons"><button id="apply-update">检查兼容性</button><button id="cancel-update">取消更新</button></div>
     <p>默认等待活动任务结束；未能安全交接时保留当前版本。快照保存应用状态，不包含链接到外部的工作目录。</p>
     <h3>回退快照</h3>
     <p>成功切换后仅保留上次回滚快照；未完成事务引用的快照也会保留。旧版未登记快照需单独确认后清理。回退前还会备份当前状态。</p>

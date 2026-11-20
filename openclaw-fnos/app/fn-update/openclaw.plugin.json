@@ -1,0 +1,8 @@
+{
+  "id": "fn-update",
+  "name": "FN-OPENCLAW 内核更新",
+  "description": "在飞牛控制台准备内核更新。",
+  "activation": { "onStartup": true },
+  "commandAliases": [{ "name": "fn_update", "kind": "runtime-slash" }],
+  "configSchema": { "type": "object", "additionalProperties": false, "properties": {} }
+}
