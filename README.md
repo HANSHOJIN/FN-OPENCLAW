@@ -1,22 +1,12 @@
 # OpenClaw for fnOS
 
 <img src="openclaw-fnos/ICON.PNG" width="64" height="64" alt="OpenClaw 图标">
-11.18同步更新到11.5.这次需要转换数据库，升级过程大约需要20分钟，非常折磨。Openclaw不能再使用这样的升级逻辑了。
 
 原版飞牛框架久久不更新了，所以自制框架。首次启动会下载本版指定的 OpenClaw 核心。
-
-老版本数据迁移建议：让老版本制作迁移文件参考文档--发给新版本--由新版本完成迁移。
-迁移要点：模型配置不要迁移，新装openclaw会提示你配置模型。随便配置一个模型以后，和他对话，让他完成迁移。只需要迁移会话记录，skill，workspace。后续缺什么可以在新版中的老会话中让他检查和补充即可。
 
 在飞牛 NAS 上运行 OpenClaw，从飞牛桌面打开原版 Control UI。FN-OPENCLAW 是由 **HANSHOJIN** 维护的第三方 FPK，无需 Docker。
 
 [下载安装包](https://github.com/HANSHOJIN/FN-OPENCLAW/releases) · [问题反馈](https://github.com/HANSHOJIN/FN-OPENCLAW/issues) · [OpenClaw 上游](https://github.com/openclaw/openclaw)
-
-![OpenClaw 在飞牛桌面中的运行界面](assets/openclaw-fnos-desktop.png)
-
-<img src="assets/openclaw-fnos-mobile.png" width="300" alt="OpenClaw 在飞牛手机 App 中的会话界面，会话名称和标识已脱敏">
-
-手机端演示图基于飞牛手机 App 实机截图，已脱敏。
 
 ## 2026.11.7 内核升级
 
@@ -28,9 +18,17 @@
 
 **预计耗时约 8–10 分钟。** 本次实测下载和兼容性检查约 3 分钟，确认切换后用 5 分 6 秒完成验收。实际耗时取决于下载速度和会话库大小。
 
-## 当前正式版更新
+## 界面截图
 
-**2026.11.6-3** 的默认内核为 **OpenClaw 2026.11.6**。从内核 **2026.11.5** 覆盖安装时，框架会升级内核并验收网关和现有会话。升级失败时恢复旧版。
+![OpenClaw 在飞牛桌面中的运行界面](assets/openclaw-fnos-desktop.png)
+
+<img src="assets/openclaw-fnos-mobile.png" width="300" alt="OpenClaw 在飞牛手机 App 中的会话界面，会话名称和标识已脱敏">
+
+手机端演示图基于飞牛手机 App 实机截图，已脱敏。
+
+## 框架版本与初始内核
+
+全新安装 **FN-OPENCLAW 2026.11.6-3** 时，初始内核为 **OpenClaw 2026.11.6**。从内核 **2026.11.5** 覆盖安装时，框架会升级内核并验收网关和现有会话。升级失败时恢复旧版。
 
 - 控制台可在线更新兼容的正式版内核。聊天命令 `/fn_update` 可发起检查，由飞牛管理员在控制台确认切换。
 - 升级和回滚期间显示控制台与当前进度，网关验收通过后自动进入聊天。
@@ -63,6 +61,16 @@
 应用默认可以读写自己的数据目录。需要处理 NAS 上的其他文件时，可在飞牛 **系统设置 → 应用 → OpenClaw → 访问权限** 中按需添加文件夹。
 
 迁移旧版会话时，先给新实例配置模型，再提供旧版记录的只读备份。用隔离副本试导入，确认历史能正常读取后再考虑合并到正式会话库。旧版的渠道、定时任务和凭据需单独处理。[OpenClaw 会话迁移说明](https://docs.openclaw.ai/cli/doctor/sqlite-maintenance#session-sqlite-migration)
+
+<details>
+<summary>早期升级和迁移备忘</summary>
+
+11.18同步更新到11.5.这次需要转换数据库，升级过程大约需要20分钟，非常折磨。Openclaw不能再使用这样的升级逻辑了。
+
+老版本数据迁移建议：让老版本制作迁移文件参考文档--发给新版本--由新版本完成迁移。
+迁移要点：模型配置不要迁移，新装openclaw会提示你配置模型。随便配置一个模型以后，和他对话，让他完成迁移。只需要迁移会话记录，skill，workspace。后续缺什么可以在新版中的老会话中让他检查和补充即可。
+
+</details>
 
 ### 给新版 OpenClaw 的迁移提示词
 
