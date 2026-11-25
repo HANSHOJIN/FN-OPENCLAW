@@ -916,7 +916,7 @@ for (const previous of frameworkPolicy.from) for (const candidateFails of [false
       download.resolve()
       await job
     }
-    assert.equal(fs.existsSync(path.join(path.dirname(f.core.gatewayEntry(CORE_VERSION)), 'doctor-called.json')), false)
+    assert.equal(fs.existsSync(path.join(path.dirname(f.core.gatewayEntry(CORE_VERSION)), 'doctor-called.json')), frameworkPolicy.doctorFix)
     assert.equal(f.core.available, true, f.core.tail())
     assert.equal(f.core.status().chatBlocked, false)
     assert.equal(f.core.version, candidateFails ? previous : CORE_VERSION)

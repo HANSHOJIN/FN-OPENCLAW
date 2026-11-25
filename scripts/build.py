@@ -98,10 +98,10 @@ def verify(output):
             core_version = re.search(r"CORE_VERSION = '([^']+)'", defaults).group(1)
             if policy['framework'] != package_version or policy['target'] != core_version:
                 raise ValueError('框架适配目标与安装包或默认内核版本不一致。')
-            if policy.get('from') != ['2026.11.5']:
+            if policy.get('from') != ['2026.11.6', '2026.11.7']:
                 raise ValueError('尚未验证的内核迁移路径。')
-            if policy.get('doctorFix') is not False:
-                raise ValueError('本版内核切换只执行只读验收，不运行 Doctor 修复。')
+            if policy.get('doctorFix') is not True:
+                raise ValueError('本版内核切换须先通过官方 Doctor 完成数据库迁移。')
             for file in ('ui/config', 'shell/server.mjs', 'shell/core.mjs', 'shell/versions.mjs', 'shell/maintenance.mjs', 'shell/index.html',
                          'shell/shell.js', 'shell/shell.css', 'shell/titlebar.js', 'shell/titlebar.css',
                          'shell/state-snapshot.mjs', 'shell/official-update.mjs', 'shell/kernel-compatibility.mjs',

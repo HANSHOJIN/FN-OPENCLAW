@@ -756,7 +756,7 @@ export class Core {
     this.log('正在使用 OpenClaw ' + version + ' 的 Doctor 适配已备份的运行数据。')
     this.log('Doctor 不设总时长上限，进度见后续输出；取消升级或停用应用会中止适配并恢复旧版。')
     const child = this.run([this.gatewayEntry(version), 'doctor', '--fix', '--non-interactive', '--yes'], {
-      ...this.env, OPENCLAW_SUPERVISOR_MODE: 'external',
+      ...this.env, OPENCLAW_SUPERVISOR_MODE: 'external', OPENCLAW_SERVICE_REPAIR_POLICY: 'external',
     })
     this.inspector = child
     const names = {

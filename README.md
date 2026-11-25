@@ -8,6 +8,12 @@
 
 [下载安装包](https://github.com/HANSHOJIN/FN-OPENCLAW/releases) · [问题反馈](https://github.com/HANSHOJIN/FN-OPENCLAW/issues) · [OpenClaw 上游](https://github.com/openclaw/openclaw)
 
+## 2026.11.10-1 测试包
+
+全新安装使用 OpenClaw 2026.11.10。内核为 2026.11.6 或 2026.11.7 时，可等正在运行的任务结束后，在飞牛应用中心直接覆盖安装。打开应用后，框架会备份运行状态，使用 11.10 的官方 Doctor 迁移数据库，并验收网关和会话库。迁移或验收失败时会恢复原版本。
+
+迁移进度可在控制台查看，耗时随数据库大小变化。手动停止过 Gateway 的实例，需从飞牛窗口菜单启动后才能执行安装包适配。
+
 ## 2026.11.7 内核升级
 
 请使用现有的 **FN-OPENCLAW 2026.11.6-3** 框架，在控制台直接将 OpenClaw 内核从 **2026.11.6** 升到 **2026.11.7**。更新入口就在 11.6-3 版中。[11.6-3 框架发布页](https://github.com/HANSHOJIN/FN-OPENCLAW/releases/tag/v2026.11.6-3)
